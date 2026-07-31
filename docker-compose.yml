@@ -11,9 +11,15 @@ services:
       FULDC_URL: "${FULDC_URL:-http://host.docker.internal:5600}"
       FULDC_USER: "${FULDC_USER:-admin}"
       FULDC_PASS: "${FULDC_PASS:?set FULDC_PASS in .env}"
-      # Root of your DC share on the FulDC++ host (a Windows path, as FulDC++ sees it).
-      # movies -> DC_ROOT\movies\ ; series -> DC_ROOT\series\<Show>\S<NN>\
-      DC_ROOT: "${DC_ROOT:-S:\\dc}"
+      # YOUR DC share root on the FulDC++ host, as a Windows path (REQUIRED).
+      # This is whatever drive/folder your FulDC++ shares from, e.g. S:\dc,
+      # D:\Media, E:\Shares\DC ... The bridge saves into:
+      #   movies -> DC_ROOT\movies\ ; series -> DC_ROOT\series\<Show>\S<NN>\
+      DC_ROOT: "${DC_ROOT:?set DC_ROOT in .env to your DC share root, e.g. S:\\dc}"
+      # Optional: override the movie/TV folders directly for non-standard
+      # layouts (take precedence over DC_ROOT). Full Windows paths.
+      MOVIES_DIR: "${MOVIES_DIR:-}"
+      SERIES_DIR: "${SERIES_DIR:-}"
       # "1" = only handle movie requests, "0" = movies + TV
       MOVIES_ONLY: "${MOVIES_ONLY:-0}"
       PORT: "8080"

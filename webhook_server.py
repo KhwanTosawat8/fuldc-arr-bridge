@@ -56,6 +56,8 @@ def _grab(title, year, *, kind, season=None):
     try:
         res = hybrid_grab(client(), title, year, kind=kind, season=season,
                           prefs=Prefs(), dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
+                          movies_dir=os.environ.get("MOVIES_DIR"),
+                          series_dir=os.environ.get("SERIES_DIR"),
                           log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
     except Exception as e:  # noqa: BLE001 - webhook must never crash the server

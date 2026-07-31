@@ -85,7 +85,8 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `FULDC_URL` | `http://host.docker.internal:5600` | FulDC++ Web API address |
 | `FULDC_USER` | `admin` | FulDC++ web user |
 | `FULDC_PASS` | — | **required** |
-| `DC_ROOT` | `S:\dc` | share root on the FulDC++ host (a Windows path). `movies→DC_ROOT\movies\`, `series→DC_ROOT\series\<Show>\S<NN>\` |
+| `DC_ROOT` | *(required)* | **your** DC share root on the FulDC++ host, a Windows path (e.g. `S:\dc`, `D:\Media`). `movies→DC_ROOT\movies\`, `series→DC_ROOT\series\<Show>\S<NN>\` |
+| `MOVIES_DIR` / `SERIES_DIR` | *(from DC_ROOT)* | optional full-path overrides for non-standard layouts |
 | `MOVIES_ONLY` | `0` | `1` = only movies, `0` = movies + TV |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
 | `PORT` | `8080` | webhook listen port |

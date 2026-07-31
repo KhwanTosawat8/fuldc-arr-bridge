@@ -17,15 +17,21 @@ BAD_SOURCE = "cam camrip ts telesync tc telecine hdcam screener sample workprint
 
 def resolve_target(kind: str, title: str, series: str | None,
                    dc_root: str = "S:\\dc", explicit: str | None = None,
-                   season: int | None = None) -> str:
+                   season: int | None = None, movies_dir: str | None = None,
+                   series_dir: str | None = None) -> str:
+    """Windows target path on the FulDC++ host. Users set their own share root
+    via DC_ROOT (e.g. D:\\Media), or override the movie/TV folders directly with
+    MOVIES_DIR / SERIES_DIR for non-standard layouts."""
     if explicit:
         return explicit
     root = dc_root.rstrip("\\/")
     if kind == "series":
+        base = (series_dir or f"{root}\\series").rstrip("\\/")
         show = (series or title).strip()
-        base = f"{root}\\series\\{show}\\"
-        return base + f"S{season:02d}\\" if season else base
-    return f"{root}\\movies\\"
+        p = f"{base}\\{show}\\"
+        return p + f"S{season:02d}\\" if season else p
+    md = (movies_dir or f"{root}\\movies").rstrip("\\/")
+    return f"{md}\\"
 
 
 def _queries(title: str, year: int | None, kind: str, season: int | None) -> list[str]:
@@ -60,10 +66,12 @@ def autosearch_matcher(title: str, year: int | None, kind: str = "movie",
 def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
                 kind: str = "movie", series: str | None = None,
                 season: int | None = None, prefs: Prefs | None = None,
-                dc_root: str = "S:\\dc", target: str | None = None,
+                dc_root: str = "S:\\dc", movies_dir: str | None = None,
+                series_dir: str | None = None, target: str | None = None,
                 wait: float = 10.0, log=print) -> dict:
     prefs = prefs or Prefs()
-    target = resolve_target(kind, title, series, dc_root, target, season)
+    target = resolve_target(kind, title, series, dc_root, target, season,
+                            movies_dir, series_dir)
     iid, results = run_search(client, title, year, wait, log, kind, season)
     if results:
         cands = rank(results, title, year, prefs, kind=kind)

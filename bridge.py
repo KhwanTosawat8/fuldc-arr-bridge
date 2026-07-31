@@ -7,13 +7,14 @@ one into a target library folder. Read-only by default; downloading requires
 
 Config via env:
   FULDC_URL   (default http://mgmt:5600)
-  FULDC_USER  (default peter)
+  FULDC_USER  (default admin)
   FULDC_PASS  (required)
-  MOVIES_DIR  Windows path on the FulDC++ host for movies (e.g. S:\\Media\\Movies\\)
+  DC_ROOT     your DC share root, a Windows path (e.g. S:\\dc, D:\\Media)
+  MOVIES_DIR / SERIES_DIR  optional full-path overrides for non-standard layouts
 
 Examples:
   FULDC_PASS=... ./bridge.py search "Dune" --year 2021
-  FULDC_PASS=... ./bridge.py grab   "Dune" --year 2021 --grab
+  FULDC_PASS=... DC_ROOT="S:\\dc" ./bridge.py grab "Dune" --year 2021 --grab
 """
 
 from __future__ import annotations
@@ -81,7 +82,10 @@ def do_grab(a) -> None:
     c = client_from_env()
     prefs = prefs_from_args(a)
     dc_root = os.environ.get("DC_ROOT", "S:\\dc")
-    target = resolve_target(a.kind, a.title, a.series, dc_root, a.target)
+    movies_dir = os.environ.get("MOVIES_DIR")
+    series_dir = os.environ.get("SERIES_DIR")
+    target = resolve_target(a.kind, a.title, a.series, dc_root, a.target,
+                            None, movies_dir, series_dir)
     if not a.grab:
         iid, results = run_search(c, a.title, a.year, a.wait)
         if iid is None:
@@ -97,7 +101,8 @@ def do_grab(a) -> None:
         print("\n# DRY RUN — re-run with --grab to actually queue this download")
         return
     res = hybrid_grab(c, a.title, a.year, kind=a.kind, series=a.series,
-                      prefs=prefs, dc_root=dc_root, target=target, wait=a.wait)
+                      prefs=prefs, dc_root=dc_root, movies_dir=movies_dir,
+                      series_dir=series_dir, target=target, wait=a.wait)
     if res["mode"] == "autosearch":
         print(f"# not shared right now → created AutoSearch item id={res['autosearch_id']} "
               f"matcher={res['matcher']!r} target={res['target']}")
