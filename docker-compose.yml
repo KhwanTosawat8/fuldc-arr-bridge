@@ -1,0 +1,23 @@
+services:
+  fuldc-arr-bridge:
+    image: ghcr.io/pete1979/fuldc-arr-bridge:latest
+    container_name: fuldc-arr-bridge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"          # Seerr posts its webhook here
+    environment:
+      # FulDC++ Web API. On the same Windows PC as FulDC++ (Docker Desktop),
+      # use host.docker.internal. Otherwise use the LAN IP, e.g. http://192.168.0.22:5600
+      FULDC_URL: "${FULDC_URL:-http://host.docker.internal:5600}"
+      FULDC_USER: "${FULDC_USER:-admin}"
+      FULDC_PASS: "${FULDC_PASS:?set FULDC_PASS in .env}"
+      # Root of your DC share on the FulDC++ host (a Windows path, as FulDC++ sees it).
+      # movies -> DC_ROOT\movies\ ; series -> DC_ROOT\series\<Show>\S<NN>\
+      DC_ROOT: "${DC_ROOT:-S:\\dc}"
+      # "1" = only handle movie requests, "0" = movies + TV
+      MOVIES_ONLY: "${MOVIES_ONLY:-0}"
+      PORT: "8080"
+    # host.docker.internal is built in on Docker Desktop (Windows/macOS).
+    # On Linux this line makes it resolve to the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

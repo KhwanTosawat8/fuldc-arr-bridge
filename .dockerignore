@@ -1,0 +1,6 @@
+k8s/
+DESIGN.md
+README.md
+__pycache__/
+*.pyc
+.git/

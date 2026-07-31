@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fuldc-bridge
+  namespace: fuldc-bridge
+  labels:
+    app.kubernetes.io/name: fuldc-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fuldc-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fuldc-bridge
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: ghcr.io/pete1979/fuldc-arr-bridge:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: FULDC_URL
+              value: "http://192.168.0.22:5600"   # FulDC++ Web API host
+            - name: FULDC_USER
+              value: "admin"
+            - name: FULDC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: fuldc-bridge-secret   # kubectl create secret generic fuldc-bridge-secret --from-literal=FULDC_PASS=...
+                  key: FULDC_PASS
+            - name: DC_ROOT
+              value: "S:\\dc"
+            - name: MOVIES_ONLY
+              value: "0"
+            - name: PORT
+              value: "8080"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

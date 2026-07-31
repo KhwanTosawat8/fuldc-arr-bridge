@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fuldc-bridge
+  namespace: fuldc-bridge
+  labels:
+    app.kubernetes.io/name: fuldc-bridge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fuldc-bridge
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
