@@ -10,7 +10,7 @@ Hybrid strategy:
 from __future__ import annotations
 
 from fuldc_client import FulDCClient
-from ranker import Prefs, rank, search_queries, strip_leading_article
+from ranker import Prefs, rank, search_queries, strip_leading_article, scene_title
 
 BAD_SOURCE = "cam camrip ts telesync tc telecine hdcam screener sample workprint"
 
@@ -36,7 +36,7 @@ def resolve_target(kind: str, title: str, series: str | None,
 
 def _queries(title: str, year: int | None, kind: str, season: int | None) -> list[str]:
     if kind == "series" and season:
-        base = strip_leading_article(title)
+        base = scene_title(strip_leading_article(title))
         return [f"{base} S{season:02d}", f"{base} S{season}"]
     return search_queries(title, year)
 
@@ -57,7 +57,7 @@ def run_search(client: FulDCClient, title: str, year: int | None,
 
 def autosearch_matcher(title: str, year: int | None, kind: str = "movie",
                        season: int | None = None) -> str:
-    base = strip_leading_article(title)
+    base = scene_title(strip_leading_article(title))
     if kind == "series" and season:
         return f"{base} S{season:02d}"
     return f"{base} {year}" if year else base
@@ -106,7 +106,7 @@ def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
     """
     target = resolve_target("series", show, None, dc_root, None, season,
                             movies_dir, series_dir)
-    base = strip_leading_article(show)
+    base = scene_title(strip_leading_article(show))
     q = f" {quality}" if quality else ""
     matcher = f"{base} S{season:02d}E%[inc]{q}"
     item = client.create_autosearch(matcher, target_directory=target,

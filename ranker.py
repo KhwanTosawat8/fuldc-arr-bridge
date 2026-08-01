@@ -33,12 +33,28 @@ def strip_leading_article(title: str) -> str:
     return ARTICLE_RE.sub("", title).strip()
 
 
+_SCENE_DROP = re.compile(r"[^\w\s.\-]+")
+
+
+def scene_title(title: str) -> str:
+    """DC releases are named scene-style: dotted, punctuation stripped
+    (e.g. 'Lord of the Rings: The Rings of Power' ->
+    'Lord.of.the.Rings.The.Rings.of.Power'). The hub search ANDs every term, so
+    a token like 'Rings:' (colon attached) matches nothing in a dotted filename.
+    Dropping punctuation and using dots is what real releases look like."""
+    t = _SCENE_DROP.sub("", title)          # drop : ' , ! ? ( ) & etc.
+    t = re.sub(r"\s+", ".", t.strip())       # spaces -> dots
+    t = re.sub(r"\.{2,}", ".", t)            # collapse repeated dots
+    return t.strip("._-")
+
+
 def search_queries(title: str, year: int | None) -> list[str]:
     """Ordered hub-search patterns to try. Leading articles are dropped because
     DC hub search ANDs every term and a stopword like 'The' can zero out an
     otherwise-valid query (verified: 'The Matrix 1999' -> 0, 'Matrix 1999' -> ok).
+    Titles are scene-formatted (dotted, no punctuation) to match DC filenames.
     """
-    base = strip_leading_article(title)
+    base = scene_title(strip_leading_article(title))
     out = [f"{base} {year}", base] if year else [base]
     seen: set[str] = set()
     ordered: list[str] = []
