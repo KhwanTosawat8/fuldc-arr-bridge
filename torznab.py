@@ -9,6 +9,8 @@ the DC result (see store.py) so the qBittorrent shim can fetch it later.
 from __future__ import annotations
 
 import re
+import hashlib
+import os
 import urllib.parse
 from email.utils import formatdate
 from xml.sax.saxutils import escape
@@ -68,9 +70,19 @@ def _magnet(h: str, title: str, size: int) -> str:
 def search_items(client: FulDCClient, *, query: str, kind: str,
                  season: int | None, limit: int, prefs: Prefs,
                  wait: float = 8.0) -> list[dict]:
-    """Run a DC search, rank, remember each result, and return Torznab items."""
+    """Run a DC search, rank, remember each result, and return Torznab items.
+
+    An empty query is Radarr/Sonarr's RSS request — and their indexer Test is
+    exactly one of those, with `releases.Empty()` treated as a hard
+    ValidationFailure. Returning [] therefore made the indexer impossible to
+    add at all. DC has no "recent releases" feed to answer it honestly, so fall
+    back to a configured probe term (RSS_PROBE, default "1080p") purely so the
+    Test has something real to chew on.
+    """
     if not query.strip():
-        return []   # RSS sync with no query — nothing to search on DC
+        query = os.environ.get("RSS_PROBE", "1080p").strip()
+        if not query:
+            return []
     # Indexer traffic is overwhelmingly Radarr/Sonarr's periodic RSS sync rather
     # than a person waiting, so search at background priority — these are the
     # ones that *should* be dropped when the client's search queue is loaded.
@@ -97,9 +109,34 @@ def search_items(client: FulDCClient, *, query: str, kind: str,
             "magnet": _magnet(h, c.release, size),
             "cat": TV_CAT if kind == "series" else MOVIE_CAT,
             "seeders": (r.get("users") or {}).get("count", 0),
-            "pubdate": formatdate(r.get("time") or None, usegmt=True),
+            "pubdate": _pubdate(r, h),
+            "infohash": h,
         })
     return items
+
+
+def _pubdate(result: dict, h: str) -> str:
+    """A stable RFC-822 date for this release.
+
+    Radarr matches delay-profile pending releases on title+pubDate+indexer, so
+    a pubDate that changes between searches produces duplicate pending entries
+    and repeated grabs. `now` was therefore the one value we must not use as a
+    fallback. Derive a fixed pseudo-date from the release hash instead, and
+    treat an implausible timestamp as absent: a millisecond value would render
+    a year-50000 date, and RssParser rejects the *entire feed* when a pubDate
+    fails to parse.
+    """
+    ts = result.get("time") or 0
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        ts = 0
+    if ts > 4102444800:          # > year 2100, almost certainly milliseconds
+        ts //= 1000
+    if not 946684800 < ts < 4102444800:   # outside 2000..2100 -> not a date
+        # Deterministic, stable, and safely in the past.
+        ts = 1262304000 + int(hashlib.sha1(h.encode()).hexdigest()[:6], 16)
+    return formatdate(ts, usegmt=True)
 
 
 def feed_xml(items: list[dict]) -> str:
@@ -119,6 +156,12 @@ def feed_xml(items: list[dict]) -> str:
             f'<link>{escape(it["magnet"])}</link>',
             f'<enclosure url="{escape(it["magnet"])}" length="{it["size"]}" '
             'type="application/x-bittorrent"/>',
+            # A bare <size> element is NOT parsed by TorznabRssParser; it reads
+            # the torznab attr first and falls back to enclosure/@length.
+            f'<torznab:attr name="size" value="{it["size"]}"/>',
+            # Blocklisting and "Blocklist and Search" key on infohash first.
+            f'<torznab:attr name="infohash" value="{it["infohash"]}"/>',
+            f'<torznab:attr name="magneturl" value="{escape(it["magnet"])}"/>',
             f'<torznab:attr name="category" value="{it["cat"]}"/>',
             f'<torznab:attr name="seeders" value="{seeders}"/>',
             f'<torznab:attr name="peers" value="{seeders}"/>',

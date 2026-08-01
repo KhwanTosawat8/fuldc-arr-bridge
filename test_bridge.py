@@ -15,6 +15,7 @@ import contextlib
 import io
 import os
 import unicodedata
+import time
 import unittest
 import unittest.mock
 import xml.etree.ElementTree as ET
@@ -24,7 +25,9 @@ os.environ.setdefault("FULDC_PASS", "test")
 import core
 import fuldc_client
 import httputil
+import qbit
 import ranker
+import store
 import torznab
 import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
@@ -294,6 +297,74 @@ class TestDirectoryDownloadResolution(unittest.TestCase):
         self.assertEqual(out["bundle_id"], 999)
 
 
+class TestExcludedWords(unittest.TestCase):
+    """FulDC++ splits excluded_string on whitespace and matches each token as a
+    SUBSTRING (SearchQuery::parseSearchString -> StringSearch.match_any, and
+    StringSearch.h:27 calls itself "a fast substring search algo").
+
+    A bare "ts" therefore excludes any title containing those two letters. The
+    AutoSearch item looks correct in the UI and simply never fires."""
+
+    # Real shows/films that contain a bad-source token as a substring
+    INNOCENT = ["Ghosts", "Roots", "Nights", "Beatstreet", "Watchmen",
+                "Scrubs", "Camelot", "The Last of Us", "Outlander",
+                "Ted Lasso", "Notting Hill", "Scream"]
+
+    # Genuinely bad releases, in the naming DC actually sees
+    JUNK = ["Dune.2021.TS.x264-GRP", "Dune.2021.CAM.XviD",
+            "Dune-2021-TS-GRP", "Movie.2020.TELESYNC.x264",
+            "Movie.2020.HDCAM.x264", "Movie.2020.sample",
+            "Movie.2020.SCR-GRP", "Movie.2020.WORKPRINT"]
+
+    def _excluded(self, name: str) -> list[str]:
+        return [tok for tok in core.BAD_SOURCE.split() if tok in name.lower()]
+
+    def test_real_titles_are_not_excluded(self):
+        for title in self.INNOCENT:
+            self.assertEqual(self._excluded(title), [],
+                             f"{title!r} would never match its own AutoSearch")
+
+    def test_junk_is_still_excluded(self):
+        for name in self.JUNK:
+            self.assertTrue(self._excluded(name), f"{name!r} slipped through")
+
+    def test_no_bare_short_tokens(self):
+        """The guard: any token under 5 chars must be delimiter-anchored."""
+        for tok in core.BAD_SOURCE.split():
+            if len(tok.strip(".-")) < 5:
+                self.assertTrue(tok[0] in ".-" and tok[-1] in ".-",
+                                f"{tok!r} is short and unanchored — it will "
+                                f"match inside ordinary words")
+
+    def test_ranker_keeps_bare_tokens(self):
+        """ranker.BAD_TOKENS matches on whitespace-split tokens, not
+        substrings, so the bare forms are correct there and must stay."""
+        self.assertIn("ts", ranker.BAD_TOKENS)
+        clean = ranker.score_result(
+            {"path": "/tv/Ghosts.S01.1080p/", "size": 9 * 1024**3,
+             "users": {"count": 2}}, "Ghosts", None, ranker.Prefs(), kind="series")
+        self.assertNotIn("BAD-source", clean.reasons)
+
+
+class TestAutoSearchSizeFloor(unittest.TestCase):
+    """The ranker rejects undersized results at -40, but the server-side
+    AutoSearch had no floor at all — so the fallback path would happily grab a
+    40 MB "sample" that a live search would have discarded."""
+
+    def test_movie_fallback_sets_min_size(self):
+        c = FakeClient()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size)
+
+    def test_episode_monitor_uses_the_episode_floor(self):
+        c = FakeClient()
+        core.monitor_tv_season(c, "Severance", 2, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size_episode)
+        self.assertLess(body["min_size"], ranker.Prefs().min_size)
+
+
 class TestSearchInstanceLifetime(unittest.TestCase):
     """Every created search instance must be released on every path."""
 
@@ -522,7 +593,8 @@ class TestSwedishTitles(unittest.TestCase):
         xml = torznab.feed_xml([{"title": "Änglagård.1992.1080p", "guid": "h",
                                  "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
                                  "cat": 2000, "seeders": 1,
-                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT"}])
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
         self.assertIn("Änglagård", ET.fromstring(xml).findtext(".//item/title"))
 
 
@@ -533,7 +605,8 @@ class TestFeedWellFormedness(unittest.TestCase):
         xml = torznab.feed_xml([{"title": "Dune\x00.2021\x08 & <x>", "guid": "h",
                                  "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
                                  "cat": 2000, "seeders": 1,
-                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT"}])
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
         ET.fromstring(xml)          # raises if not well-formed
 
 
@@ -566,6 +639,174 @@ class TestRankerQuality(unittest.TestCase):
                self._res("/m/Dune.2021.1080p.WEB/", size=8 * 1024**3, users=9)]
         self.assertEqual(ranker.rank(res, "Dune", 2021, ranker.Prefs())[0]
                          .result["users"]["count"], 9)
+
+class TestStoreEviction(unittest.TestCase):
+    def setUp(self):
+        store._store.clear()
+
+    def test_get_promotes_so_active_entries_survive(self):
+        """Insertion order is not LRU: without promotion on read, two indexers
+        RSS-syncing evict the map within hours, so a release found in the
+        morning fails as 'unknown magnet' that evening."""
+        store.put("keep", {"release": "A"})
+        for i in range(store._MAX):
+            if i == store._MAX // 2:
+                store.get("keep")          # touched halfway through
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertIsNotNone(store.get("keep"),
+                             "an entry read recently was evicted anyway")
+
+    def test_cap_is_enforced(self):
+        for i in range(store._MAX + 50):
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertLessEqual(len(store._store), store._MAX)
+
+
+class TestQbitReporting(unittest.TestCase):
+    """Radarr's queue is driven entirely by /torrents/info. Reporting the
+    wrong thing there loses downloads silently."""
+
+    def setUp(self):
+        qbit._torrents.clear()
+        store._store.clear()
+
+    def test_partial_bundle_failure_keeps_the_rest(self):
+        """One unreachable bundle must not empty the whole response — Radarr
+        reads [] as 'every download disappeared' and clears its queue."""
+        qbit._track("a" * 40, {"name": "A", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 1})
+        qbit._track("b" * 40, {"name": "B", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 2})
+
+        class Boom(FakeClient):
+            def list_bundles(self, *a, **kw):
+                raise RuntimeError("FulDC++ unreachable")
+
+            def get_bundle(self, bid):
+                if bid == 1:
+                    raise RuntimeError("gone")
+                return {"id": 2, "status": {"id": "queued", "str": "50%"}}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = qbit.info(Boom(), "radarr")
+        self.assertEqual(len(out), 2, "a failed lookup dropped the other torrent")
+
+    def test_duplicate_add_is_ignored(self):
+        h = "c" * 40
+        qbit._track(h, {"name": "A", "category": "radarr", "size": 1,
+                        "save_path": "", "added_on": 0, "bundle_id": 9})
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertEqual(qbit._torrents[h]["bundle_id"], 9,
+                         "a retried add re-queued the same release")
+
+    def test_unknown_magnet_is_reported_failed(self):
+        h = "d" * 40
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertTrue(qbit._torrents[h]["failed"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(qbit.info(FakeClient(), "radarr")[0]["state"], "error")
+
+
+class _NoBundles(FakeClient):
+    def list_bundles(self, *a, **kw):
+        return []
+
+
+class TestArrPathBlockers(unittest.TestCase):
+    """Five independent faults, each of which alone prevents a release ever
+    reaching the library. Verified against Radarr/Sonarr's own source."""
+
+    NAME = "Dune.2021.1080p.BluRay.x264-GRP"
+
+    def setUp(self):
+        qbit._torrents.clear()
+
+    def _row(self, entry):
+        qbit._track("a" * 40, entry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows = qbit.info(_NoBundles(), "radarr")
+        return rows[0] if rows else None
+
+    def test_content_path_differs_from_save_path(self):
+        """Radarr: if ContentPath == SavePath it sets the item to Warning and
+        refuses to import — 'Path matches client base download directory'."""
+        sp, cp = qbit._paths({"name": self.NAME, "save_path": "S:\\dc\\movies\\"},
+                             {"target": "S:\\dc\\movies\\"})
+        self.assertNotEqual(sp, cp)
+        self.assertTrue(cp.endswith(self.NAME), cp)
+
+    def test_content_path_is_not_doubled_when_target_is_the_item(self):
+        sp, cp = qbit._paths({"name": self.NAME},
+                             {"target": "S:\\dc\\movies\\" + self.NAME})
+        self.assertEqual(cp, "S:\\dc\\movies\\" + self.NAME)
+        self.assertEqual(sp, "S:\\dc\\movies")
+
+    def test_seed_limits_say_use_global(self):
+        """Omitted limits deserialize to 0, and HasReachedSeedLimit then reads
+        that as an explicit limit already met — so Radarr deletes every
+        completed download when 'Remove Completed Downloads' is on."""
+        row = self._row({"name": self.NAME, "category": "radarr", "size": 100,
+                         "save_path": "S:\\dc\\movies\\", "added_on": 0,
+                         "bundle_id": None})
+        for field in ("ratio_limit", "seeding_time_limit",
+                      "inactive_seeding_time_limit"):
+            self.assertEqual(row[field], -2, field)
+
+    def test_failed_grab_is_dropped_so_radarr_retries(self):
+        """Radarr maps 'error' to Warning, never Failed: the item would sit in
+        the queue forever, never blocklisted, never retried."""
+        entry = {"name": self.NAME, "category": "radarr", "size": 1,
+                 "save_path": "", "bundle_id": None, "failed": True,
+                 "added_on": int(time.time())}
+        self.assertIsNotNone(self._row(dict(entry)), "should show during grace")
+        qbit._torrents.clear()
+        entry["added_on"] = int(time.time()) - qbit.FAILED_GRACE_SECONDS - 1
+        self.assertIsNone(self._row(entry), "should be dropped after grace")
+
+    def test_custom_category_survives_create(self):
+        """The client Test creates its category, re-reads /categories, and
+        fails if it still isn't listed."""
+        qbit.create_category("radarr-4k", "S:\\dc\\4k")
+        self.assertIn("radarr-4k", qbit.categories())
+
+    def test_rss_query_is_not_empty(self):
+        """Radarr's indexer Test is one RSS request with no search terms, and
+        zero items is a hard ValidationFailure — so an empty result made the
+        indexer impossible to add at all."""
+        c = FakeClient({("GET", "/search/1/results/0/200"): (200, [])})
+        with contextlib.redirect_stdout(io.StringIO()):
+            torznab.search_items(c, query="", kind="movie", season=None,
+                                 limit=10, prefs=ranker.Prefs(), wait=0)
+        self.assertTrue(any(p.endswith("/hub_search") for _, p, _ in c.calls),
+                        "an empty query never reached the hubs")
+
+
+class TestTorznabFeedFields(unittest.TestCase):
+    def test_pubdate_is_stable(self):
+        """Radarr matches pending releases on title+pubDate+indexer, so a
+        pubDate of 'now' produces duplicate pending entries and re-grabs."""
+        h = "c" * 40
+        self.assertEqual(torznab._pubdate({"time": 0}, h),
+                         torznab._pubdate({"time": None}, h))
+
+    def test_millisecond_timestamps_do_not_poison_the_feed(self):
+        """RssParser rejects the ENTIRE feed when a pubDate fails to parse."""
+        got = torznab._pubdate({"time": 1700000000000}, "d" * 40)
+        self.assertIn("2023", got)
+
+    def test_size_and_infohash_are_torznab_attrs(self):
+        """A bare <size> element is not parsed; blocklisting keys on infohash."""
+        xml = torznab.feed_xml([{"title": "X", "guid": "h", "size": 123,
+                                 "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
+        self.assertIn('name="size" value="123"', xml)
+        self.assertIn('name="infohash"', xml)
 
 
 if __name__ == "__main__":

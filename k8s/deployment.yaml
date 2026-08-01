@@ -7,6 +7,12 @@ metadata:
     app.kubernetes.io/name: fuldc-bridge
 spec:
   replicas: 1
+  # The release->magnet map and the tracked-download table are in-process, so
+  # two pods behind one Service answer with different state: a Torznab search
+  # served by pod A produces a magnet pod B has never heard of. Recreate keeps
+  # a rollout from briefly running two.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: fuldc-bridge
@@ -43,16 +49,36 @@ spec:
               value: "0"
             - name: PORT
               value: "8080"
+            # Kept in step with docker-compose; all optional.
+            - name: WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fuldc-bridge-secret
+                  key: WEBHOOK_TOKEN
+                  optional: true
+            - name: QUALITY
+              value: ""
+            - name: MOVIES_DIR
+              value: ""
+            - name: SERIES_DIR
+              value: ""
+            - name: MEDIASERVER
+              value: "none"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          # Readiness depends on FulDC++ actually answering; "/" always
+          # returns 200, so probing it reports a pod healthy with FULDC_PASS
+          # unset and the client unreachable. Liveness stays on "/" — a
+          # liveness probe that depends on FulDC++ would restart this pod
+          # every time the client restarts.
           readinessProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 15
           livenessProbe:
             httpGet:
               path: /

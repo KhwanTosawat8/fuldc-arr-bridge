@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -132,18 +133,31 @@ class Handler(BaseHTTPRequestHandler):
             urls = [u for u in re.split(r"[\r\n]+", f.get("urls", "")) if u.strip()]
             try:
                 qbit.add(client(), urls, f.get("category", ""))
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] add error: {e}", flush=True)
+            except Exception:  # noqa: BLE001
+                # "Ok." makes Radarr record a successful grab for a download
+                # that will never exist: nothing in the queue, no retry, no
+                # blocklist. "Fails." is what lets it try the next release.
+                print(f"[qbit] add error:\n{traceback.format_exc()}", flush=True)
+                return self._send(200, b"Fails.", "text/plain")
             return self._send(200, b"Ok.", "text/plain")
         if path == "/api/v2/torrents/delete":
             f = self._form()
             hashes = [h for h in f.get("hashes", "").split("|") if h]
             try:
-                qbit.delete(client(), hashes, f.get("deleteFiles", "false") == "true")
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] delete error: {e}", flush=True)
+                qbit.delete(client(), hashes,
+                            f.get("deleteFiles", "false").lower() == "true")
+            except Exception:  # noqa: BLE001
+                print("[qbit] delete error:\n" + traceback.format_exc(), flush=True)
             return self._send(200, b"Ok.", "text/plain")
-        # createCategory / setCategory / setForceStart / etc. — accept silently
+        if path in ("/api/v2/torrents/createCategory",
+                    "/api/v2/torrents/editCategory"):
+            # Radarr's client Test creates its category then re-reads
+            # /categories and fails if it still isn't listed, so this must
+            # actually be remembered.
+            f = self._form()
+            qbit.create_category(f.get("category", ""), f.get("savePath", ""))
+            return self._send(200, b"Ok.", "text/plain")
+        # setCategory / setForceStart / etc. — accept silently
         self._read_body()
         self._send(200, b"Ok.", "text/plain")
 
@@ -161,14 +175,34 @@ class Handler(BaseHTTPRequestHandler):
             cat = params.get("category", [None])[0]
             try:
                 return self._json(qbit.info(client(), cat))
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] info error: {e}", flush=True)
-                return self._json([])
+            except Exception:  # noqa: BLE001
+                # An empty list reads to Radarr as "every download vanished",
+                # which clears its queue on one transient blip. A 502 reads as
+                # "client unreachable" — true, and recoverable.
+                print(f"[qbit] info error:\n{traceback.format_exc()}", flush=True)
+                return self._send(502, b"[]", "application/json")
+        if path == "/api/v2/torrents/files":
+            # Radarr deserializes this as a JSON *list*; {} is a parse error.
+            return self._json([])
+        if path == "/api/v2/torrents/properties":
+            # IsTorrentLoaded() is literally this call after every add, so
+            # answering {} for an unknown hash makes a failed add look
+            # successful. 404 unless we are actually tracking it.
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            h = (params.get("hash", [""])[0] or "").lower()
+            if h and h in qbit._torrents:
+                return self._json(qbit.properties(h))
+            return self._send(404, b"Not found", "text/plain")
         self._json({})
 
     def _torznab(self, params: dict):
         if not _apikey_ok(params):
-            return self._send(401, b'<error code="100" description="Incorrect API key"/>')
+            # Newznab convention is HTTP 200 with an <error> element, which is
+            # what makes the *arr report "invalid API key" rather than a
+            # generic connection failure.
+            return self._send(
+                200, b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                     b'<error code="100" description="Incorrect user credentials"/>')
         t = params.get("t", ["search"])[0]
         if t == "caps":
             return self._send(200, torznab.caps_xml().encode())
