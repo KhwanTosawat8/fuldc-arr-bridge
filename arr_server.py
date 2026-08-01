@@ -15,13 +15,16 @@ Env: FULDC_URL, FULDC_USER, FULDC_PASS, DC_ROOT, MOVIES_DIR, SERIES_DIR,
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fuldc_client import FulDCClient
 from ranker import Prefs
 import torznab
+import qbit
 
 
 def client() -> FulDCClient:
@@ -45,16 +48,89 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, obj, code: int = 200):
+        self._send(code, json.dumps(obj).encode(), "application/json")
+
+    def _read_body(self) -> bytes:
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def _form(self) -> dict:
+        """Parse an urlencoded or multipart POST body into {field: value}."""
+        body = self._read_body()
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" in ctype:
+            m = re.search(r"boundary=(.+)", ctype)
+            fields: dict = {}
+            if m:
+                for part in body.split(b"--" + m.group(1).strip().encode()):
+                    if b"Content-Disposition" not in part:
+                        continue
+                    head, _, val = part.partition(b"\r\n\r\n")
+                    nm = re.search(rb'name="([^"]+)"', head)
+                    if nm:
+                        fields[nm.group(1).decode()] = val.rstrip(b"\r\n").decode("utf-8", "replace")
+            return fields
+        return {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()}
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = urllib.parse.parse_qs(parsed.query)
-
         if path in ("/torznab/api", "/api"):
             return self._torznab(params)
-        if path in ("", "/", "/health"):
+        if path.startswith("/api/v2/"):
+            return self._qbit_get(path)
+        if path in ("", "/health"):
             return self._send(200, b"fuldc-arr-bridge arr server up", "text/plain")
         self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        if path == "/api/v2/auth/login":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Set-Cookie", "SID=fuldc-arr-bridge; HttpOnly; path=/")
+            self.end_headers()
+            return self.wfile.write(b"Ok.")
+        if path == "/api/v2/torrents/add":
+            f = self._form()
+            urls = [u for u in re.split(r"[\r\n]+", f.get("urls", "")) if u.strip()]
+            try:
+                qbit.add(client(), urls, f.get("category", ""))
+            except Exception as e:  # noqa: BLE001
+                print(f"[qbit] add error: {e}", flush=True)
+            return self._send(200, b"Ok.", "text/plain")
+        if path == "/api/v2/torrents/delete":
+            f = self._form()
+            hashes = [h for h in f.get("hashes", "").split("|") if h]
+            try:
+                qbit.delete(client(), hashes, f.get("deleteFiles", "false") == "true")
+            except Exception as e:  # noqa: BLE001
+                print(f"[qbit] delete error: {e}", flush=True)
+            return self._send(200, b"Ok.", "text/plain")
+        # createCategory / setCategory / setForceStart / etc. — accept silently
+        self._read_body()
+        self._send(200, b"Ok.", "text/plain")
+
+    def _qbit_get(self, path: str):
+        if path == "/api/v2/app/version":
+            return self._send(200, qbit.version().encode(), "text/plain")
+        if path == "/api/v2/app/webapiVersion":
+            return self._send(200, qbit.webapi_version().encode(), "text/plain")
+        if path == "/api/v2/app/preferences":
+            return self._json(qbit.preferences())
+        if path == "/api/v2/torrents/categories":
+            return self._json(qbit.categories())
+        if path == "/api/v2/torrents/info":
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cat = params.get("category", [None])[0]
+            try:
+                return self._json(qbit.info(client(), cat))
+            except Exception as e:  # noqa: BLE001
+                print(f"[qbit] info error: {e}", flush=True)
+                return self._json([])
+        self._json({})
 
     def _torznab(self, params: dict):
         if not _apikey_ok(params):
