@@ -14,13 +14,19 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import unicodedata
 import unittest
 import unittest.mock
+import xml.etree.ElementTree as ET
+
 os.environ.setdefault("FULDC_PASS", "test")
 
 import core
+import fuldc_client
 import httputil
+import qbit
 import ranker
+import store
 import torznab
 import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
@@ -469,6 +475,75 @@ class TestRequestedSeasons(unittest.TestCase):
         for payload in [{}, {"extra": None}, {"extra": ["nope"]},
                         self._p("All Seasons"), self._p(None)]:
             self.assertIsInstance(webhook_server.requested_seasons(payload), list)
+class TestStoreEviction(unittest.TestCase):
+    def setUp(self):
+        store._store.clear()
+
+    def test_get_promotes_so_active_entries_survive(self):
+        """Insertion order is not LRU: without promotion on read, two indexers
+        RSS-syncing evict the map within hours, so a release found in the
+        morning fails as 'unknown magnet' that evening."""
+        store.put("keep", {"release": "A"})
+        for i in range(store._MAX):
+            if i == store._MAX // 2:
+                store.get("keep")          # touched halfway through
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertIsNotNone(store.get("keep"),
+                             "an entry read recently was evicted anyway")
+
+    def test_cap_is_enforced(self):
+        for i in range(store._MAX + 50):
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertLessEqual(len(store._store), store._MAX)
+
+
+class TestQbitReporting(unittest.TestCase):
+    """Radarr's queue is driven entirely by /torrents/info. Reporting the
+    wrong thing there loses downloads silently."""
+
+    def setUp(self):
+        qbit._torrents.clear()
+        store._store.clear()
+
+    def test_partial_bundle_failure_keeps_the_rest(self):
+        """One unreachable bundle must not empty the whole response — Radarr
+        reads [] as 'every download disappeared' and clears its queue."""
+        qbit._track("a" * 40, {"name": "A", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 1})
+        qbit._track("b" * 40, {"name": "B", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 2})
+
+        class Boom(FakeClient):
+            def list_bundles(self, *a, **kw):
+                raise RuntimeError("FulDC++ unreachable")
+
+            def get_bundle(self, bid):
+                if bid == 1:
+                    raise RuntimeError("gone")
+                return {"id": 2, "status": {"id": "queued", "str": "50%"}}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = qbit.info(Boom(), "radarr")
+        self.assertEqual(len(out), 2, "a failed lookup dropped the other torrent")
+
+    def test_duplicate_add_is_ignored(self):
+        h = "c" * 40
+        qbit._track(h, {"name": "A", "category": "radarr", "size": 1,
+                        "save_path": "", "added_on": 0, "bundle_id": 9})
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertEqual(qbit._torrents[h]["bundle_id"], 9,
+                         "a retried add re-queued the same release")
+
+    def test_unknown_magnet_is_reported_failed(self):
+        h = "d" * 40
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertTrue(qbit._torrents[h]["failed"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(qbit.info(FakeClient(), "radarr")[0]["state"], "error")
 
 
 if __name__ == "__main__":
