@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fuldc_client import FulDCClient
 from ranker import Prefs
 from core import hybrid_grab, monitor_tv_season
+from metadata import is_kids
 
 APPROVED = {"MEDIA_APPROVED", "MEDIA_AUTO_APPROVED"}
 YEAR_RE = re.compile(r"\((\d{4})\)")
@@ -38,7 +39,22 @@ def parse(payload: dict):
     m = YEAR_RE.search(subject)
     year = int(m.group(1)) if m else None
     title = (YEAR_RE.sub("", subject).strip(" -") if m else subject).strip()
-    return nt, mtype, title, year
+    try:
+        tmdb = int(media.get("tmdbId")) if media.get("tmdbId") not in (None, "") else None
+    except (TypeError, ValueError):
+        tmdb = None
+    return nt, mtype, title, year, tmdb
+
+
+def _request_dirs(kids: bool):
+    """Return (movies_dir, series_dir) for this request. Kids content goes to
+    dedicated folders (default <DC_ROOT>\\kids.movies / kids.series)."""
+    if kids:
+        root = os.environ.get("DC_ROOT", "S:\\dc").rstrip("\\/")
+        mov = os.environ.get("KIDS_MOVIES_DIR") or f"{root}\\kids.movies"
+        ser = os.environ.get("KIDS_SERIES_DIR") or f"{root}\\kids.series"
+        return mov, ser
+    return os.environ.get("MOVIES_DIR"), os.environ.get("SERIES_DIR")
 
 
 def requested_seasons(payload: dict) -> list[int]:
@@ -60,28 +76,27 @@ def _prefs() -> Prefs:
     return p
 
 
-def _grab(title, year, *, kind, season=None):
+def _grab(title, year, *, kind, season=None, movies_dir=None, series_dir=None):
     print(f"[grab] {title!r} ({year}) type={kind}" + (f" S{season:02d}" if season else ""),
           flush=True)
     try:
         res = hybrid_grab(client(), title, year, kind=kind, season=season,
                           prefs=_prefs(), dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
-                          movies_dir=os.environ.get("MOVIES_DIR"),
-                          series_dir=os.environ.get("SERIES_DIR"),
+                          movies_dir=movies_dir, series_dir=series_dir,
                           log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
     except Exception as e:  # noqa: BLE001 - webhook must never crash the server
         print(f"[error] {title!r}: {e}", flush=True)
 
 
-def _monitor_tv(title, season):
+def _monitor_tv(title, season, *, series_dir=None):
     q = os.environ.get("QUALITY", "").strip() or None
     print(f"[grab] {title!r} series S{season:02d} (monitor %[inc])", flush=True)
     try:
         res = monitor_tv_season(client(), title, season,
                                 dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
                                 movies_dir=os.environ.get("MOVIES_DIR"),
-                                series_dir=os.environ.get("SERIES_DIR"),
+                                series_dir=series_dir,
                                 quality=q, log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
     except Exception as e:  # noqa: BLE001 - webhook must never crash the server
@@ -89,7 +104,7 @@ def _monitor_tv(title, season):
 
 
 def handle(payload: dict) -> None:
-    nt, mtype, title, year = parse(payload)
+    nt, mtype, title, year, tmdb = parse(payload)
     if nt not in APPROVED:
         print(f"[skip] notification_type={nt}", flush=True)
         return
@@ -99,15 +114,20 @@ def handle(payload: dict) -> None:
     if not title:
         print("[skip] empty title", flush=True)
         return
+    kids = (os.environ.get("KIDS_ROUTING", "1") == "1"
+            and is_kids(tmdb, mtype, log=lambda m: print(m, flush=True)))
+    mov_dir, ser_dir = _request_dirs(kids)
+    if kids:
+        print(f"[kids] routing {title!r} -> kids folders", flush=True)
     if mtype == "tv":
         seasons = requested_seasons(payload)
         if seasons:
             for season in seasons:
-                _monitor_tv(title, season)   # %[inc] ongoing-episode monitor
+                _monitor_tv(title, season, series_dir=ser_dir)   # %[inc] monitor
         else:
-            _grab(title, year, kind="series")   # no season info -> best-effort grab
+            _grab(title, year, kind="series", series_dir=ser_dir)
     else:
-        _grab(title, year, kind="movie")
+        _grab(title, year, kind="movie", movies_dir=mov_dir)
 
 
 class Handler(BaseHTTPRequestHandler):

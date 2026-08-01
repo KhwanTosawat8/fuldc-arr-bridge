@@ -89,6 +89,11 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `MOVIES_DIR` / `SERIES_DIR` | *(from DC_ROOT)* | optional full-path overrides for non-standard layouts |
 | `MOVIES_ONLY` | `0` | `1` = only movies, `0` = movies + TV |
 | `QUALITY` | *(any)* | e.g. `1080p` — movies: only that quality is grabbed; TV: baked into the `%[inc]` episode monitor |
+| `KIDS_ROUTING` | `1` | route kids titles to `kids.movies` / `kids.series` (needs a metadata source below; `0` disables) |
+| `TMDB_API_KEY` | — | metadata source for kids routing — a free TMDB API key |
+| `SEERR_URL` / `SEERR_API_KEY` | — | alternative metadata source: reuse your Seerr/Jellyseerr/Overseerr |
+| `KIDS_MOVIES_DIR` / `KIDS_SERIES_DIR` | *(from DC_ROOT)* | override kids folders (full Windows paths) |
+| `KIDS_GENRES` | `Kids,Family` | genres that mark a title as kids (Animation alone is **not** kids) |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
 | `PORT` | `8080` | webhook listen port |
 
