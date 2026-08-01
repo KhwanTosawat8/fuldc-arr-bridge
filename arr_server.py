@@ -16,7 +16,6 @@ Env: FULDC_URL, FULDC_USER, FULDC_PASS, DC_ROOT, MOVIES_DIR, SERIES_DIR,
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import re
@@ -25,6 +24,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fuldc_client import FulDCClient
+from httputil import read_body, secure_equal
 from ranker import Prefs
 import torznab
 import qbit
@@ -43,7 +43,7 @@ def client() -> FulDCClient:
 def _apikey_ok(params: dict) -> bool:
     # TORZNAB_APIKEY is required at startup, so `want` is always non-empty here
     want = os.environ.get("TORZNAB_APIKEY", "")
-    return hmac.compare_digest(params.get("apikey", [""])[0], want)
+    return secure_equal(params.get("apikey", [""])[0], want)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,8 +58,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
     def _read_body(self) -> bytes:
-        n = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(n) if n else b""
+        return read_body(self)
 
     def _form(self) -> dict:
         """Parse an urlencoded or multipart POST body into {field: value}."""
@@ -88,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
             k, _, v = part.strip().partition("=")
-            if k == "SID" and hmac.compare_digest(v, _SID):
+            if k == "SID" and secure_equal(v, _SID):
                 return True
         return False
 
@@ -115,8 +114,8 @@ class Handler(BaseHTTPRequestHandler):
             want_pass = os.environ.get("QBIT_PASS", "")
             if want_pass:
                 want_user = os.environ.get("QBIT_USER", "admin")
-                ok = (hmac.compare_digest(f.get("username", ""), want_user)
-                      and hmac.compare_digest(f.get("password", ""), want_pass))
+                ok = (secure_equal(f.get("username", ""), want_user)
+                      and secure_equal(f.get("password", ""), want_pass))
                 if not ok:
                     print(f"[qbit] failed login from {self.client_address[0]}", flush=True)
                     return self._send(200, b"Fails.", "text/plain")
