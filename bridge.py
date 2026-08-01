@@ -25,7 +25,7 @@ import sys
 
 from fuldc_client import FulDCClient, FulDCError
 from ranker import Prefs, rank
-from core import run_search, resolve_target, hybrid_grab
+from core import hybrid_grab, resolve_target, run_search, searched
 
 
 def human(n: float) -> str:
@@ -88,12 +88,12 @@ def do_grab(a) -> None:
     target = resolve_target(a.kind, a.title, a.series, dc_root, a.target,
                             season, movies_dir, series_dir)
     if not a.grab:
-        iid, results = run_search(c, a.title, a.year, a.wait, kind=a.kind, season=season)
-        if iid is None:
-            print(f"# nothing shared now — would create an AutoSearch item → {target}")
-            return
-        cands = rank(results, a.title, a.year, prefs, kind=a.kind)
-        c.close(iid)
+        with searched(c, a.title, a.year, wait=a.wait,
+                      kind=a.kind, season=season) as (iid, results):
+            if iid is None:
+                print(f"# nothing shared now — would create an AutoSearch item → {target}")
+                return
+            cands = rank(results, a.title, a.year, prefs, kind=a.kind)
         if cands:
             best = cands[0]
             print(f"# best: [{best.score}] {best.release}")

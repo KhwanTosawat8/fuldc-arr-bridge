@@ -10,6 +10,7 @@ Hybrid strategy:
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 
 from fuldc_client import PRIO_HIGH, FulDCClient
 from ranker import Prefs, rank, search_queries, strip_leading_article, scene_title
@@ -109,6 +110,29 @@ def run_search(client: FulDCClient, title: str, year: int | None,
     return None, []
 
 
+@contextmanager
+def searched(client: FulDCClient, title: str, year: int | None, *,
+             wait: float = 10.0, log=print, kind: str = "movie",
+             season: int | None = None, priority: int = PRIO_HIGH):
+    """run_search, with the search instance guaranteed released.
+
+    A FulDC++ search instance lives server-side until it is DELETEd or the
+    session ends. Ranking, download_result and the network can all raise
+    between opening one and closing it, so consumers go through here instead of
+    pairing the calls by hand — every hand-paired site had at least one path
+    that skipped the close.
+    """
+    iid, results = run_search(client, title, year, wait, log, kind, season, priority)
+    try:
+        yield iid, results
+    finally:
+        if iid is not None:
+            try:
+                client.close(iid)
+            except Exception as e:  # noqa: BLE001 - never mask the real error
+                log(f"# warning: could not close search instance {iid}: {e}")
+
+
 def autosearch_matcher(title: str, year: int | None, kind: str = "movie",
                        season: int | None = None) -> str:
     base = scene_title(strip_leading_article(title))
@@ -137,18 +161,17 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
     prefs = prefs or Prefs()
     target = resolve_target(kind, title, series, dc_root, target, season,
                             movies_dir, series_dir, year)
-    iid, results = run_search(client, title, year, wait, log, kind, season)
-    if results:
-        cands = rank(results, title, year, prefs, kind=kind)
-        if cands:
-            best = cands[0]
-            info = client.download_result(iid, best.result["id"], target, name=best.release)
-            client.close(iid)
-            return {"mode": "download", "release": best.release, "score": best.score,
-                    "bundle_id": info.get("bundle_id"), "target": target, "season": season}
-        client.close(iid)
-    elif iid is not None:
-        client.close(iid)
+    with searched(client, title, year, wait=wait, log=log,
+                  kind=kind, season=season) as (iid, results):
+        if results:
+            cands = rank(results, title, year, prefs, kind=kind)
+            if cands:
+                best = cands[0]
+                info = client.download_result(iid, best.result["id"], target,
+                                              name=best.release)
+                return {"mode": "download", "release": best.release,
+                        "score": best.score, "bundle_id": info.get("bundle_id"),
+                        "target": target, "season": season}
     # nothing available now -> persistent AutoSearch. Bake the required quality
     # into the search string so FulDC++ only grabs matching releases (the
     # server-side AutoSearch can't reuse the ranker's quality filter).
@@ -193,19 +216,18 @@ def grab_tv_season(client: FulDCClient, show: str, season: int, *,
     prefs = prefs or Prefs()
     target = resolve_target("series", show, None, dc_root, None, season,
                             movies_dir, series_dir, year)
-    iid, results = run_search(client, show, None, wait, log, "series", season)
-    if results:
-        cands = rank(results, show, None, prefs, kind="series")
-        if cands:
-            best = cands[0]
-            info = client.download_result(iid, best.result["id"], target, name=best.release)
-            client.close(iid)
-            log(f"# season pack {best.release!r} -> {target}")
-            return {"mode": "download", "release": best.release, "score": best.score,
-                    "bundle_id": info.get("bundle_id"), "target": target, "season": season}
-        client.close(iid)
-    elif iid is not None:
-        client.close(iid)
+    with searched(client, show, None, wait=wait, log=log,
+                  kind="series", season=season) as (iid, results):
+        if results:
+            cands = rank(results, show, None, prefs, kind="series")
+            if cands:
+                best = cands[0]
+                info = client.download_result(iid, best.result["id"], target,
+                                              name=best.release)
+                log(f"# season pack {best.release!r} -> {target}")
+                return {"mode": "download", "release": best.release,
+                        "score": best.score, "bundle_id": info.get("bundle_id"),
+                        "target": target, "season": season}
     return monitor_tv_season(client, show, season, year=year, dc_root=dc_root,
                              movies_dir=movies_dir, series_dir=series_dir,
                              quality=quality, prefs=prefs, log=log)

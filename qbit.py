@@ -17,7 +17,7 @@ import re
 import time
 
 from fuldc_client import FulDCClient
-from core import resolve_target, run_search
+from core import resolve_target, searched
 import store
 
 _BTIH = re.compile(r"btih:([0-9a-fA-F]{40})", re.IGNORECASE)
@@ -62,8 +62,12 @@ def _btih(magnet: str) -> str | None:
 
 def _reacquire(client: FulDCClient, info: dict):
     """Re-run the DC search and match the exact release, then queue it."""
-    iid, results = run_search(client, info["pattern"], None, wait=8,
-                              kind=info["kind"], season=info.get("season"))
+    with searched(client, info["pattern"], None, wait=8, kind=info["kind"],
+                  season=info.get("season")) as (iid, results):
+        return _match_and_queue(client, info, iid, results)
+
+
+def _match_and_queue(client: FulDCClient, info: dict, iid, results):
     match = None
     for r in results:
         if info.get("tth"):
@@ -74,8 +78,6 @@ def _reacquire(client: FulDCClient, info: dict):
             match = r
             break
     if match is None:
-        if iid is not None:
-            client.close(iid)
         return None
     # For series the folder name should be the show, not Radarr's raw query
     # string (which carries season/quality terms) — fall back to the pattern
@@ -86,7 +88,6 @@ def _reacquire(client: FulDCClient, info: dict):
                             info.get("season"), os.environ.get("MOVIES_DIR"),
                             os.environ.get("SERIES_DIR"))
     dl = client.download_result(iid, match["id"], target, name=info["release"])
-    client.close(iid)
     return dl.get("bundle_id"), target
 
 

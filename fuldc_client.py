@@ -87,11 +87,22 @@ class FulDCClient:
         st, inst = self._call("POST", "/search")
         if st != 200:
             raise FulDCError(f"create search instance http {st}: {inst}", st)
+        if not isinstance(inst, dict) or inst.get("id") is None:
+            raise FulDCError(f"create search instance: unexpected body {inst!r}", st)
         iid = inst["id"]
+        # The instance now exists server-side and lives until we DELETE it, so
+        # nothing below may escape without closing it first.
+        try:
+            return iid, self._collect(iid, pattern, wait, poll, plateau, priority)
+        except BaseException:
+            self.close(iid)
+            raise
+
+    def _collect(self, iid: int, pattern: str, wait: float, poll: float,
+                 plateau: float, priority: int) -> list[dict]:
         st, data = self._call("POST", f"/search/{iid}/hub_search",
                               {"priority": priority, "query": {"pattern": pattern}})
         if st != 200:
-            self.close(iid)
             # 503 = "Search queue overflow": the client's outgoing search queue
             # is backed up past 20 minutes. Caller decides whether to back off.
             raise FulDCError(f"hub_search http {st}: {data}", st)
@@ -106,7 +117,7 @@ class FulDCClient:
             elif count > 0 and (time.time() - stable_since) >= plateau:
                 break
         _, results = self._call("GET", f"/search/{iid}/results/0/200")
-        return iid, (results or [])
+        return results or []
 
     def close(self, instance_id: int) -> None:
         self._call("DELETE", f"/search/{instance_id}")
