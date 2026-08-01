@@ -290,6 +290,74 @@ class TestDirectoryDownloadResolution(unittest.TestCase):
         self.assertEqual(out["bundle_id"], 999)
 
 
+class TestExcludedWords(unittest.TestCase):
+    """FulDC++ splits excluded_string on whitespace and matches each token as a
+    SUBSTRING (SearchQuery::parseSearchString -> StringSearch.match_any, and
+    StringSearch.h:27 calls itself "a fast substring search algo").
+
+    A bare "ts" therefore excludes any title containing those two letters. The
+    AutoSearch item looks correct in the UI and simply never fires."""
+
+    # Real shows/films that contain a bad-source token as a substring
+    INNOCENT = ["Ghosts", "Roots", "Nights", "Beatstreet", "Watchmen",
+                "Scrubs", "Camelot", "The Last of Us", "Outlander",
+                "Ted Lasso", "Notting Hill", "Scream"]
+
+    # Genuinely bad releases, in the naming DC actually sees
+    JUNK = ["Dune.2021.TS.x264-GRP", "Dune.2021.CAM.XviD",
+            "Dune-2021-TS-GRP", "Movie.2020.TELESYNC.x264",
+            "Movie.2020.HDCAM.x264", "Movie.2020.sample",
+            "Movie.2020.SCR-GRP", "Movie.2020.WORKPRINT"]
+
+    def _excluded(self, name: str) -> list[str]:
+        return [tok for tok in core.BAD_SOURCE.split() if tok in name.lower()]
+
+    def test_real_titles_are_not_excluded(self):
+        for title in self.INNOCENT:
+            self.assertEqual(self._excluded(title), [],
+                             f"{title!r} would never match its own AutoSearch")
+
+    def test_junk_is_still_excluded(self):
+        for name in self.JUNK:
+            self.assertTrue(self._excluded(name), f"{name!r} slipped through")
+
+    def test_no_bare_short_tokens(self):
+        """The guard: any token under 5 chars must be delimiter-anchored."""
+        for tok in core.BAD_SOURCE.split():
+            if len(tok.strip(".-")) < 5:
+                self.assertTrue(tok[0] in ".-" and tok[-1] in ".-",
+                                f"{tok!r} is short and unanchored — it will "
+                                f"match inside ordinary words")
+
+    def test_ranker_keeps_bare_tokens(self):
+        """ranker.BAD_TOKENS matches on whitespace-split tokens, not
+        substrings, so the bare forms are correct there and must stay."""
+        self.assertIn("ts", ranker.BAD_TOKENS)
+        clean = ranker.score_result(
+            {"path": "/tv/Ghosts.S01.1080p/", "size": 9 * 1024**3,
+             "users": {"count": 2}}, "Ghosts", None, ranker.Prefs(), kind="series")
+        self.assertNotIn("BAD-source", clean.reasons)
+
+
+class TestAutoSearchSizeFloor(unittest.TestCase):
+    """The ranker rejects undersized results at -40, but the server-side
+    AutoSearch had no floor at all — so the fallback path would happily grab a
+    40 MB "sample" that a live search would have discarded."""
+
+    def test_movie_fallback_sets_min_size(self):
+        c = FakeClient()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size)
+
+    def test_episode_monitor_uses_the_episode_floor(self):
+        c = FakeClient()
+        core.monitor_tv_season(c, "Severance", 2, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size_episode)
+        self.assertLess(body["min_size"], ranker.Prefs().min_size)
+
+
 class TestSearchInstanceLifetime(unittest.TestCase):
     """Every created search instance must be released on every path."""
 
