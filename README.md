@@ -188,13 +188,14 @@ via your secret manager.
 ## Credits
 
 Built on the [AirDC++ Web API](https://airdcpp.docs.apiary.io/). Thanks to the
-**FulDC++** developers (Sulan & Lansh) and **AirDC-NG** for confirming the
-`auto_search` / RSS API surface.
+**FulDC++** team and to **[KhwanTosawat8](https://github.com/KhwanTosawat8)** for
+confirming the `auto_search` / RSS API surface.
 
-Special thanks to **[Lansh](https://github.com/KhwanTosawat8) (AirDC-NG)** for
-substantial code contributions — AutoSearch `%[inc]` incrementation
-(`use_params`), search priority, 409 duplicate handling, download-path safety,
-and the test suite + CI — grounded in the AirDC++ source. See the
+Special thanks to **[KhwanTosawat8](https://github.com/KhwanTosawat8)** — an
+AirDC++ developer — for substantial code contributions: AutoSearch `%[inc]`
+incrementation (`use_params`), search priority, duplicate handling,
+download-path safety, HTTP hardening, and the test suite + CI, all grounded in
+the AirDC++ source. See the
 [contributors](https://github.com/Pete1979/fuldc-arr-bridge/graphs/contributors).
 
 ## License
