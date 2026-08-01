@@ -178,7 +178,8 @@ class FulDCClient:
                           remove_after_hit: bool = True, action: str = "download",
                           use_params: bool = False, cur_number: int = 1,
                           max_number: int = 0, number_length: int = 2,
-                          expire_days: int = 0) -> dict:
+                          expire_days: int = 0, matcher_type: str = "partial",
+                          matcher_string: str = "") -> dict:
         """Create (or update, if it already exists) a persistent AutoSearch item.
 
         The client keeps searching and auto-downloads to target_directory when
@@ -197,12 +198,16 @@ class FulDCClient:
         body: dict = {
             "search_string": search_string,
             "action": action,
-            "matcher_type": "partial",
+            "matcher_type": matcher_type,
             "remove_after_hit": remove_after_hit,
             # let the client skip what we already have instead of re-grabbing it
             "check_already_queued": True,
             "check_already_shared": True,
         }
+        if matcher_string:
+            # a separate matcher (e.g. a regex) validates results while
+            # search_string still drives the wide hub search
+            body["matcher_string"] = matcher_string
         if use_params:
             # %[inc] expansion: start at cur_number, zero-pad to number_length,
             # 0 = no upper bound (AutoSearch.cpp:161-175, 190-204)

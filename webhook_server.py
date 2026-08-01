@@ -109,12 +109,12 @@ def _grab(title, year, *, kind, season=None, movies_dir=None, series_dir=None):
         print(f"[error] {title!r}: {e}", flush=True)
 
 
-def _grab_season(title, season, *, series_dir=None):
+def _grab_season(title, season, *, series_dir=None, year=None):
     q = os.environ.get("QUALITY", "").strip() or None
     print(f"[grab] {title!r} series S{season:02d}", flush=True)
     try:
         c = client()
-        res = grab_tv_season(c, title, season, prefs=_prefs(),
+        res = grab_tv_season(c, title, season, year=year, prefs=_prefs(),
                              dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
                              movies_dir=os.environ.get("MOVIES_DIR"),
                              series_dir=series_dir,
@@ -153,7 +153,7 @@ def handle(payload: dict) -> None:
                 _grab(title, year, kind="series", season=season, series_dir=ser_dir)
         elif seasons:
             for season in seasons:
-                _grab_season(title, season, series_dir=ser_dir)   # pack now, else %[inc] monitor
+                _grab_season(title, season, series_dir=ser_dir, year=year)   # pack now, else %[inc] monitor
         else:
             _grab(title, year, kind="series", series_dir=ser_dir)
     else:

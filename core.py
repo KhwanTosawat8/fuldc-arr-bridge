@@ -42,7 +42,7 @@ def safe_component(name: str) -> str:
 def resolve_target(kind: str, title: str, series: str | None,
                    dc_root: str = "S:\\dc", explicit: str | None = None,
                    season: int | None = None, movies_dir: str | None = None,
-                   series_dir: str | None = None) -> str:
+                   series_dir: str | None = None, year: int | None = None) -> str:
     """Windows target path on the FulDC++ host. Users set their own share root
     via DC_ROOT (e.g. D:\\Media), or override the movie/TV folders directly with
     MOVIES_DIR / SERIES_DIR for non-standard layouts.
@@ -55,6 +55,9 @@ def resolve_target(kind: str, title: str, series: str | None,
     if kind == "series":
         base = (series_dir or f"{root}\\series").rstrip("\\/")
         show = safe_component(series or title)
+        if year:
+            # disambiguate for the media server (e.g. Shameless US vs UK)
+            show = f"{show} ({year})"
         p = f"{base}\\{show}\\"
         return p + f"S{season:02d}\\" if season else p
     md = (movies_dir or f"{root}\\movies").rstrip("\\/")
@@ -101,7 +104,7 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
                 wait: float = 10.0, log=print) -> dict:
     prefs = prefs or Prefs()
     target = resolve_target(kind, title, series, dc_root, target, season,
-                            movies_dir, series_dir)
+                            movies_dir, series_dir, year)
     iid, results = run_search(client, title, year, wait, log, kind, season)
     if results:
         cands = rank(results, title, year, prefs, kind=kind)
@@ -120,15 +123,28 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
     matcher = autosearch_matcher(title, year, kind, season)
     if prefs.require_quality:
         matcher = f"{matcher} {prefs.require_quality[0]}"
+    # For an ended-show SEASON, match a PACK not a single episode: partial
+    # matching treats "S03" as a substring of "S03E02", so use a regex matcher
+    # requiring the season token to be followed by a non-episode char (and the
+    # required quality). The search_string still drives the hub search.
+    matcher_type, matcher_string = "partial", ""
+    if kind == "series" and season:
+        looks = [f"(?=.*[Ss]{season:02d}(?:[^0-9Ee]|$))"]
+        if prefs.require_quality:
+            looks.append(f"(?=.*{re.escape(prefs.require_quality[0])})")
+        matcher_type, matcher_string = "regex", "(?i)" + "".join(looks) + ".*"
     item = client.create_autosearch(matcher, target_directory=target,
                                     excluded=BAD_SOURCE,
-                                    expire_days=AUTOSEARCH_TTL_DAYS)
+                                    expire_days=AUTOSEARCH_TTL_DAYS,
+                                    matcher_type=matcher_type,
+                                    matcher_string=matcher_string)
     return {"mode": "autosearch", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}
 
 
 def grab_tv_season(client: FulDCClient, show: str, season: int, *,
-                   prefs: Prefs | None = None, dc_root: str = "S:\\dc",
+                   year: int | None = None, prefs: Prefs | None = None,
+                   dc_root: str = "S:\\dc",
                    movies_dir: str | None = None, series_dir: str | None = None,
                    quality: str | None = None, wait: float = 10.0,
                    log=print) -> dict:
@@ -140,7 +156,7 @@ def grab_tv_season(client: FulDCClient, show: str, season: int, *,
     so try a real search first, exactly like the movie path does."""
     prefs = prefs or Prefs()
     target = resolve_target("series", show, None, dc_root, None, season,
-                            movies_dir, series_dir)
+                            movies_dir, series_dir, year)
     iid, results = run_search(client, show, None, wait, log, "series", season)
     if results:
         cands = rank(results, show, None, prefs, kind="series")
@@ -154,13 +170,14 @@ def grab_tv_season(client: FulDCClient, show: str, season: int, *,
         client.close(iid)
     elif iid is not None:
         client.close(iid)
-    return monitor_tv_season(client, show, season, dc_root=dc_root,
+    return monitor_tv_season(client, show, season, year=year, dc_root=dc_root,
                              movies_dir=movies_dir, series_dir=series_dir,
                              quality=quality, log=log)
 
 
 def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
-                      dc_root: str = "S:\\dc", movies_dir: str | None = None,
+                      year: int | None = None, dc_root: str = "S:\\dc",
+                      movies_dir: str | None = None,
                       series_dir: str | None = None, quality: str | None = None,
                       first_episode: int = 1, log=print) -> dict:
     """Create a persistent per-episode AutoSearch for an ongoing season using the
@@ -172,7 +189,7 @@ def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
     token is searched for literally and the monitor silently never matches.
     """
     target = resolve_target("series", show, None, dc_root, None, season,
-                            movies_dir, series_dir)
+                            movies_dir, series_dir, year)
     base = scene_title(strip_leading_article(show))
     q = f" {quality}" if quality else ""
     matcher = f"{base} S{season:02d}E%[inc]{q}"

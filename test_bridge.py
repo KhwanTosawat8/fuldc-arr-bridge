@@ -217,5 +217,36 @@ class TestSceneTitle(unittest.TestCase):
         self.assertIn("Rings.of.Power", ss)
 
 
+class TestYearFolder(unittest.TestCase):
+    def test_series_folder_gets_year(self):
+        got = core.resolve_target("series", "Shameless", None, r"S:\dc", None, 3,
+                                  year=2011)
+        self.assertEqual(got, "S:\\dc\\series\\Shameless (2011)\\S03\\")
+
+    def test_no_year_is_unchanged(self):
+        got = core.resolve_target("series", "Silo", None, r"S:\dc", None, 2)
+        self.assertEqual(got, "S:\\dc\\series\\Silo\\S02\\")
+
+
+class TestSeasonPackMatcher(unittest.TestCase):
+    """An ended-show season AutoSearch must match a PACK, not a single episode
+    (partial matching treats S03 as a substring of S03E02)."""
+
+    def test_ended_season_uses_pack_regex(self):
+        import re as _re
+        c = FakeClient()
+        core.hybrid_grab(c, "Shameless", None, kind="series", season=3,
+                         prefs=ranker.Prefs(require_quality=["1080p"]),
+                         wait=0, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body["matcher_type"], "regex")
+        rx = _re.compile(body["matcher_string"])
+        self.assertTrue(rx.search("Shameless.US.S03.1080p.BluRay.x264-ROVERS"))
+        self.assertFalse(rx.search("Shameless.US.S03E02.1080p.BluRay.x264-ROVERS"),
+                         "must not match a single episode")
+        self.assertFalse(rx.search("Shameless.US.S03.720p.BluRay"),
+                         "must not match the wrong quality")
+
+
 if __name__ == "__main__":
     unittest.main()
