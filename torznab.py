@@ -12,7 +12,7 @@ import urllib.parse
 from email.utils import formatdate
 from xml.sax.saxutils import escape
 
-from fuldc_client import FulDCClient
+from fuldc_client import PRIO_LOW, FulDCClient
 from ranker import Prefs, rank
 from core import run_search
 import store
@@ -27,9 +27,12 @@ def caps_xml() -> str:
 <caps>
   <server version="1.0" title="fuldc-arr-bridge"/>
   <limits max="100" default="50"/>
+  <!-- Only advertise what we actually implement: DC has no id-based lookup, so
+       claiming imdbid/tmdbid/tvdbid makes Radarr/Sonarr send id-only searches
+       (empty q) that can never return a result. -->
   <searching>
     <search available="yes" supportedParams="q"/>
-    <movie-search available="yes" supportedParams="q,imdbid,tmdbid"/>
+    <movie-search available="yes" supportedParams="q"/>
     <tv-search available="yes" supportedParams="q,season,ep"/>
   </searching>
   <categories>
@@ -49,7 +52,11 @@ def search_items(client: FulDCClient, *, query: str, kind: str,
     """Run a DC search, rank, remember each result, and return Torznab items."""
     if not query.strip():
         return []   # RSS sync with no query — nothing to search on DC
-    iid, results = run_search(client, query, None, wait=8, kind=kind, season=season)
+    # Indexer traffic is overwhelmingly Radarr/Sonarr's periodic RSS sync rather
+    # than a person waiting, so search at background priority — these are the
+    # ones that *should* be dropped when the client's search queue is loaded.
+    iid, results = run_search(client, query, None, wait=8, kind=kind,
+                              season=season, priority=PRIO_LOW)
     cands = rank(results, query, None, prefs, kind=kind)
     if iid is not None:
         client.close(iid)
@@ -60,7 +67,9 @@ def search_items(client: FulDCClient, *, query: str, kind: str,
         size = int(r.get("size") or 0)
         h = store.synthetic_hash(r)
         store.put(h, {
-            "pattern": query, "kind": kind, "season": season,
+            # `q` on a tvsearch is the bare show title — remember it so the
+            # download client files the release under the right folder
+            "pattern": query, "show": query, "kind": kind, "season": season,
             "release": c.release, "tth": r.get("tth") or "",
             "path": r.get("path") or "", "size": size,
         })

@@ -16,7 +16,19 @@ from typing import Any
 
 
 class FulDCError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+# Priority enum values, per airdcpp/core/types/Priority.h:23-33. The API
+# defaults an absent priority to LOW (FileSearchParser.cpp:34-37), which is both
+# the slowest per-hub interval (15s vs 5s) and the first class rejected by the
+# search-queue overflow guard (SearchEntity.cpp:184 sheds priority <= NORMAL).
+# Always send one explicitly.
+PRIO_LOW = 3        # background/RSS-shaped polling: shed me first, that's correct
+PRIO_NORMAL = 4
+PRIO_HIGH = 5       # someone is waiting on this: interactive grabs
 
 
 class FulDCClient:
@@ -43,6 +55,11 @@ class FulDCClient:
                 return e.code, json.loads(body_txt or "{}")
             except json.JSONDecodeError:
                 return e.code, {"message": body_txt}
+        except (urllib.error.URLError, OSError) as e:
+            # connection refused / DNS / timeout — surface as our own error type
+            # so callers don't have to catch raw urllib exceptions
+            raise FulDCError(f"{method} {path}: cannot reach FulDC++ at "
+                             f"{self.base} ({e})") from e
 
     # --- generic ---------------------------------------------------------
     def system_info(self) -> dict:
@@ -57,20 +74,27 @@ class FulDCClient:
 
     # --- search ----------------------------------------------------------
     def search(self, pattern: str, wait: float = 10.0, poll: float = 1.0,
-               plateau: float = 3.0) -> tuple[int, list[dict]]:
+               plateau: float = 3.0, priority: int = PRIO_HIGH) -> tuple[int, list[dict]]:
         """Run a hub search, wait for results to settle, return (instance_id, results).
 
         Waits up to `wait` seconds, stopping early once result_count has been
         unchanged for `plateau` seconds. Caller is responsible for close().
+
+        `priority` is a top-level field of the hub_search body (sibling of
+        `query`), not part of the matcher. Omitting it means LOW — see the
+        PRIO_* constants above for why that is the wrong default for us.
         """
         st, inst = self._call("POST", "/search")
         if st != 200:
-            raise FulDCError(f"create search instance http {st}: {inst}")
+            raise FulDCError(f"create search instance http {st}: {inst}", st)
         iid = inst["id"]
-        st, _ = self._call("POST", f"/search/{iid}/hub_search", {"query": {"pattern": pattern}})
+        st, data = self._call("POST", f"/search/{iid}/hub_search",
+                              {"priority": priority, "query": {"pattern": pattern}})
         if st != 200:
             self.close(iid)
-            raise FulDCError(f"hub_search http {st}")
+            # 503 = "Search queue overflow": the client's outgoing search queue
+            # is backed up past 20 minutes. Caller decides whether to back off.
+            raise FulDCError(f"hub_search http {st}: {data}", st)
         deadline = time.time() + wait
         last_count, stable_since = -1, time.time()
         while time.time() < deadline:
@@ -95,9 +119,9 @@ class FulDCClient:
         (trailing backslash added). Returns {'bundle_id':..., 'merged':...}.
 
         File results return a bundle_info immediately. DIRECTORY results kick off
-        a filelist (directory) download first, so the bundle appears
-        asynchronously — we resolve it by matching the release `name` in the
-        queue (falling back to the directory_downloads list)."""
+        a filelist (directory) download first and return `directory_download_ids`,
+        so the bundle appears asynchronously — we poll exactly those ids until
+        one carries a bundle."""
         body: dict = {}
         if target_directory:
             td = target_directory.replace("/", "\\")
@@ -111,19 +135,25 @@ class FulDCClient:
         bi = data.get("bundle_info") or {}
         if bi.get("id"):
             return {"bundle_id": bi["id"], "merged": bi.get("merged")}
-        # directory download — resolve the bundle asynchronously
-        if name:
-            for _ in range(15):
+        # Directory result: the API hands back the ids of the directory downloads
+        # it started. Poll *those* — scanning the global list would happily pick
+        # up a concurrent grab's bundle instead of ours.
+        dd_ids = data.get("directory_download_ids") or []
+        for _ in range(15):
+            for dd_id in dd_ids:
+                qb = (self.get_directory_download(dd_id).get("queue_info") or {}).get("bundle") or {}
+                if qb.get("id"):
+                    return {"bundle_id": qb["id"], "merged": qb.get("merged")}
+            if name:
                 for b in self.list_bundles():
                     if b.get("name") == name:
                         return {"bundle_id": b["id"], "merged": True}
-                time.sleep(1)
-        _, dds = self._call("GET", "/filelists/directory_downloads")
-        for dd in (dds or []):
-            qb = (dd.get("queue_info") or {}).get("bundle") or {}
-            if qb.get("id"):
-                return {"bundle_id": qb["id"], "merged": qb.get("merged")}
+            time.sleep(1)
         return {"bundle_id": None, "raw": data}
+
+    def get_directory_download(self, dd_id) -> dict:
+        st, data = self._call("GET", f"/filelists/directory_downloads/{dd_id}")
+        return data or {} if st == 200 else {}
 
     def list_bundles(self, start: int = 0, count: int = 200) -> list[dict]:
         _, data = self._call("GET", f"/queue/bundles/{start}/{count}")
@@ -145,16 +175,41 @@ class FulDCClient:
 
     def create_autosearch(self, search_string: str, target_directory: str | None = None,
                           excluded: str = "", file_type: str = "", min_size: int = 0,
-                          remove_after_hit: bool = True, action: str = "download") -> dict:
-        """Create a persistent AutoSearch item — the client keeps searching and
-        auto-downloads (to target_directory) when the release appears. Ideal for
-        content nobody is sharing right this moment."""
+                          remove_after_hit: bool = True, action: str = "download",
+                          use_params: bool = False, cur_number: int = 1,
+                          max_number: int = 0, number_length: int = 2,
+                          expire_days: int = 0) -> dict:
+        """Create (or update, if it already exists) a persistent AutoSearch item.
+
+        The client keeps searching and auto-downloads to target_directory when
+        the release appears — for content nobody is sharing right this moment.
+
+        `use_params` is REQUIRED for %[inc] episode monitors. AutoSearch.cpp:207
+        returns early from formatParams when useParams is false, and
+        usingIncrementation() (:264) gates on it too — so without this flag a
+        search string of "Show S01E%[inc]" is sent to hubs verbatim and matches
+        nothing, forever.
+
+        The API 409s on a duplicate search_string (AutoSearchApi.cpp:322-325),
+        so re-requesting the same title must update the existing item rather
+        than fail.
+        """
         body: dict = {
             "search_string": search_string,
             "action": action,
             "matcher_type": "partial",
             "remove_after_hit": remove_after_hit,
+            # let the client skip what we already have instead of re-grabbing it
+            "check_already_queued": True,
+            "check_already_shared": True,
         }
+        if use_params:
+            # %[inc] expansion: start at cur_number, zero-pad to number_length,
+            # 0 = no upper bound (AutoSearch.cpp:161-175, 190-204)
+            body.update({"use_params": True, "cur_number": cur_number,
+                         "max_number": max_number, "number_length": number_length})
+        if expire_days:
+            body["expire_time"] = int(time.time()) + expire_days * 86400
         if excluded:
             body["excluded_string"] = excluded
         if file_type:
@@ -167,9 +222,27 @@ class FulDCClient:
                 td += "\\"
             body["target"] = td
         st, data = self._call("POST", "/auto_search/items", body)
+        if st == 409:
+            existing = self.find_autosearch(search_string)
+            if existing:
+                return self.update_autosearch(existing["id"], body) or existing
         if st not in (200, 201):
-            raise FulDCError(f"create autosearch http {st}: {data}")
+            raise FulDCError(f"create autosearch http {st}: {data}", st)
         return data or {}
+
+    def find_autosearch(self, search_string: str) -> dict | None:
+        for item in self.list_autosearch():
+            if item.get("search_string") == search_string:
+                return item
+        return None
+
+    def update_autosearch(self, item_id: int, body: dict) -> dict | None:
+        """PATCH an existing item. Re-enables it and refreshes target/expiry —
+        a repeat request for the same title should revive a spent item."""
+        patch = {k: v for k, v in body.items() if k != "search_string"}
+        patch["enabled"] = True
+        st, data = self._call("PATCH", f"/auto_search/items/{item_id}", patch)
+        return data if st in (200, 201) else None
 
     def delete_autosearch(self, item_id: int) -> bool:
         st, _ = self._call("DELETE", f"/auto_search/items/{item_id}")
@@ -179,9 +252,12 @@ class FulDCClient:
         st, _ = self._call("POST", f"/auto_search/items/{item_id}/search")
         return st in (200, 204)
 
-    # terminal bundle statuses (best-effort; validated live during a real grab)
-    DONE_OK = {"completed", "shared"}
-    DONE_BAD = {"completion_validation_error", "hash_failed", "download_failed", "failed"}
+    # Bundle status ids, per QueueBundleUtils.cpp: new, queued, recheck,
+    # downloaded, download_error, completion_validation_running,
+    # completion_validation_error, completed, shared.
+    DONE_OK = {"completed", "shared"}           # finished and (re)shared
+    DONE_ON_DISK = DONE_OK | {"downloaded"}     # data is on disk; validation may still run
+    DONE_BAD = {"download_error", "completion_validation_error"}
 
     def wait_bundle(self, bundle_id: int, timeout: int = 3600, poll: int = 5,
                     on_status=None) -> dict | None:
@@ -200,7 +276,7 @@ class FulDCClient:
                 if on_status:
                     on_status(sid, b)
                 last = sid
-            if sid in self.DONE_OK or sid in self.DONE_BAD:
+            if sid in self.DONE_ON_DISK or sid in self.DONE_BAD:
                 return b
             _t.sleep(poll)
         return self.get_bundle(bundle_id)

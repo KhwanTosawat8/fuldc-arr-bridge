@@ -25,6 +25,20 @@ services:
       # Optional quality filter, e.g. 1080p. Movies: only that quality is grabbed.
       # TV: baked into the %[inc] episode monitor. Blank = any quality.
       QUALITY: "${QUALITY:-}"
+      # Optional shared secret. If set, Seerr's webhook URL must carry it:
+      # http://<host>:8080/?token=<value>  (or an X-Webhook-Token header).
+      # Leave blank only if this port is strictly LAN-internal — anyone who can
+      # reach it can queue downloads.
+      WEBHOOK_TOKEN: "${WEBHOOK_TOKEN:-}"
+      # Optional post-download library refresh: plex | jellyfin | webhook | none
+      MEDIASERVER: "${MEDIASERVER:-none}"
+      PLEX_URL: "${PLEX_URL:-}"
+      PLEX_TOKEN: "${PLEX_TOKEN:-}"
+      PLEX_MOVIES_SECTION: "${PLEX_MOVIES_SECTION:-Movies}"
+      PLEX_SERIES_SECTION: "${PLEX_SERIES_SECTION:-TV Shows}"
+      JELLYFIN_URL: "${JELLYFIN_URL:-}"
+      JELLYFIN_TOKEN: "${JELLYFIN_TOKEN:-}"
+      NOTIFY_WEBHOOK: "${NOTIFY_WEBHOOK:-}"
       PORT: "8080"
     # host.docker.internal is built in on Docker Desktop (Windows/macOS).
     # On Linux this line makes it resolve to the host.
@@ -54,7 +68,12 @@ services:
       DC_ROOT: "${DC_ROOT:?set DC_ROOT in .env}"
       MOVIES_DIR: "${MOVIES_DIR:-}"
       SERIES_DIR: "${SERIES_DIR:-}"
-      TORZNAB_APIKEY: "${TORZNAB_APIKEY:-changeme}"
+      # Required — same value goes in the Radarr/Sonarr indexer config.
+      TORZNAB_APIKEY: "${TORZNAB_APIKEY:?set TORZNAB_APIKEY in .env}"
+      # Credentials for the qBittorrent-compatible download client. Blank =
+      # anyone who can reach :9117 can queue downloads.
+      QBIT_USER: "${QBIT_USER:-}"
+      QBIT_PASS: "${QBIT_PASS:-}"
       ARR_PORT: "9117"
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -92,7 +92,8 @@ class Prefs:
     prefer_codec: list[str] = field(default_factory=lambda: ["x265", "x264"])
     prefer_lang: list[str] = field(default_factory=list)   # e.g. ["swesub"]
     require_quality: list[str] = field(default_factory=list)  # e.g. ["1080p"]; empty = any
-    min_size: int = 700 * 1024**2          # 700 MB
+    min_size: int = 700 * 1024**2          # 700 MB (movies / season packs)
+    min_size_episode: int = 100 * 1024**2  # 100 MB (a single TV episode is small)
     max_size: int = 100 * 1024**3          # 100 GB
     min_users: int = 1
 
@@ -104,6 +105,13 @@ class Candidate:
     year: int | None
     score: float
     reasons: list[str]
+    path: str = ""
+
+    def quality_haystack(self) -> str:
+        """Quality/codec/language tokens often live in a *subfolder* of the
+        release dir (…/Release.Name.2021/1080p/), which parse_release_folder
+        deliberately skips — so match against the whole path, not the name."""
+        return normalize(f"{self.path} {self.release}")
 
 
 def score_result(result: dict, title: str, year: int | None, prefs: Prefs,
@@ -133,19 +141,26 @@ def score_result(result: dict, title: str, year: int | None, prefs: Prefs,
         score -= 20; reasons.append(f"year!={ryear}")
 
     low = rel_norm
+    # quality/codec/language may sit in a subfolder of the release dir, so look
+    # at the full path as well as the release name
+    hay = normalize(f"{path} {release}")
     for i, q in enumerate(prefs.prefer_quality):
-        if q in low:
+        if q in hay:
             score += 12 - i * 2; reasons.append(q); break
     for i, c in enumerate(prefs.prefer_codec):
-        if c in low:
+        if c in hay:
             score += 6 - i; reasons.append(c); break
     for lg in prefs.prefer_lang:
-        if lg in low:
+        if lg in hay:
             score += 10; reasons.append(lg); break
 
+    # bad-source tokens stay scoped to the release name — hub root folders
+    # ("/-x264-Kids/…") would otherwise poison every result
     if any(b in low.split() for b in BAD_TOKENS):
         score -= 60; reasons.append("BAD-source")
-    if size < prefs.min_size:
+    floor = (prefs.min_size_episode
+             if kind == "series" and SEASON_EP_RE.search(release) else prefs.min_size)
+    if size < floor:
         score -= 40; reasons.append("too-small")
     if size > prefs.max_size:
         score -= 20; reasons.append("too-big")
@@ -165,7 +180,7 @@ def score_result(result: dict, title: str, year: int | None, prefs: Prefs,
             score += 20; reasons.append("season-pack")
 
     score += (result.get("relevance") or 0) * 2
-    return Candidate(result, release, ryear, round(score, 1), reasons)
+    return Candidate(result, release, ryear, round(score, 1), reasons, path)
 
 
 def rank(results: list[dict], title: str, year: int | None, prefs: Prefs,
@@ -175,6 +190,7 @@ def rank(results: list[dict], title: str, year: int | None, prefs: Prefs,
         cands = [c for c in cands if not c.result.get("dupe")]
     if prefs.require_quality:
         want = [q.lower() for q in prefs.require_quality]
-        cands = [c for c in cands if any(q in c.release.lower() for q in want)]
+        cands = [c for c in cands
+                 if any(q in c.quality_haystack() for q in want)]
     cands.sort(key=lambda c: c.score, reverse=True)
     return cands

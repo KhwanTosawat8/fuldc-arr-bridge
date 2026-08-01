@@ -37,7 +37,9 @@ for and where to save it. No volume mounts, no database.
 ## Requirements
 
 - **[FulDC++](https://fuldcpp.net)** (Windows) with the **Web UI enabled** and a
-  **web user** that has search/download/queue permissions.
+  **web user** that has **search**, **download** and **settings edit**
+  permissions. Settings-edit is what AutoSearch item creation requires — without
+  it every "nobody's sharing this yet" fallback fails with a 403.
 - A request frontend: **[Seerr](https://seerr.dev)** / **Jellyseerr** /
   **Overseerr**, connected to your media server (Plex, Jellyfin, or Emby).
 - **Docker** — Docker Desktop on Windows works great; run it on the same PC as
@@ -67,7 +69,7 @@ host's LAN IP, e.g. `http://192.168.0.22:5600`.
 
 | field | value |
 |---|---|
-| Webhook URL | `http://<docker-host>:8080/` (if Seerr runs in Docker on the same host, `http://host.docker.internal:8080/`) |
+| Webhook URL | `http://<docker-host>:8080/` (if Seerr runs in Docker on the same host, `http://host.docker.internal:8080/`). If you set `WEBHOOK_TOKEN`, append `?token=<value>`. |
 | JSON Payload | leave the **default** |
 | Notification Types | enable **Request Approved** *and* **Request Automatically Approved** |
 
@@ -95,6 +97,7 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `KIDS_MOVIES_DIR` / `KIDS_SERIES_DIR` | *(from DC_ROOT)* | override kids folders (full Windows paths) |
 | `KIDS_GENRES` | `Kids,Family` | genres that mark a title as kids (Animation alone is **not** kids) |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
+| `WEBHOOK_TOKEN` | *(empty)* | shared secret for the webhook endpoint. Blank = **anyone who can reach the port can queue downloads** — set it unless the port is strictly LAN-internal |
 | `PORT` | `8080` | webhook listen port |
 
 Optional media-server refresh (most servers scan periodically anyway):
@@ -104,13 +107,15 @@ Optional media-server refresh (most servers scan periodically anyway):
 ## What it does with a request
 
 - **Movies** → best-ranked release into `DC_ROOT\movies\`.
-- **TV** → per requested season into `DC_ROOT\series\<Show>\S<NN>\`, preferring
-  full **season packs** over single episodes.
-  - **Ongoing show** (status *Returning*) → creates a `%[inc]` per-episode
-    AutoSearch that keeps grabbing new episodes as they air (Sonarr-style).
-  - **Ended/canceled show** → grabs each season as a pack instead (a `%[inc]`
-    monitor would never match, since past seasons ship as packs). Needs a
-    metadata source (`TMDB_API_KEY` or `SEERR_URL`+`SEERR_API_KEY`).
+- **TV** → per requested season into `DC_ROOT\series\<Show>\S<NN>\`. A shared
+  **season pack** is grabbed straight away (the ranker prefers packs over single
+  episodes).
+  - **Ongoing show** (status *Returning*) → if no pack is shared yet, a `%[inc]`
+    per-episode AutoSearch monitor keeps grabbing new episodes as they air
+    (Sonarr-style).
+  - **Ended/canceled show** → grabs each season as a pack (a `%[inc]` monitor
+    would never match, since past seasons ship as packs). Needs a metadata
+    source (`TMDB_API_KEY` or `SEERR_URL`+`SEERR_API_KEY`).
 - **Available now** → downloads immediately. **Not shared yet** → creates an
   AutoSearch item so FulDC++ grabs it when it appears.
 - Ranking uses title/year/quality/language and skips CAM/TS/sample and content
@@ -124,10 +129,21 @@ The image also ships the `bridge.py` CLI:
 ```bash
 docker compose run --rm fuldc-arr-bridge python bridge.py search "Dune" --year 2021
 docker compose run --rm fuldc-arr-bridge python bridge.py grab "Dune" --year 2021 --grab
-docker compose run --rm fuldc-arr-bridge python bridge.py grab "Severance" --kind series --grab
+docker compose run --rm fuldc-arr-bridge python bridge.py grab "Severance" --kind series --season 2 --grab
 ```
 
 `search` is read-only; `grab` is a dry run unless you add `--grab`.
+
+## Development
+
+```bash
+python -m unittest -v test_bridge     # stdlib only, no network, ~1ms
+```
+
+The tests fake the FulDC++ API at the transport boundary and assert the exact
+request bodies. Several of them guard behaviour the API requires but doesn't
+enforce — a missing `use_params`, for example, produces an AutoSearch item that
+looks fine in the UI and silently never matches anything.
 
 ## Experimental: full Radarr/Sonarr integration
 
@@ -137,13 +153,18 @@ docker compose run --rm fuldc-arr-bridge python bridge.py grab "Severance" --kin
 > directly. The API integration works; the *import* side (remote-path mapping +
 > how Radarr treats RAR content) still needs real-world tuning.
 
-Enable it:
+Enable it (set `TORZNAB_APIKEY` in `.env` first — the arr server refuses to
+start without one, since this port can queue downloads):
 ```bash
 docker compose --profile arr up -d      # starts fuldc-arr on :9117
 ```
 Then in Radarr/Sonarr:
 - **Indexer** → Generic Torznab, URL `http://<host>:9117/torznab`, API key = `TORZNAB_APIKEY`.
-- **Download client** → qBittorrent, host `<host>`, port `9117`.
+- **Download client** → qBittorrent, host `<host>`, port `9117`, username/password
+  = `QBIT_USER`/`QBIT_PASS` (set them; blank means no authentication).
+
+Note the release → magnet mapping is in-memory: after a restart, a grab from a
+pre-restart search reports as failed and Radarr re-queries on its next cycle.
 
 Feedback welcome — see [DESIGN.md](DESIGN.md) for the architecture.
 
@@ -156,6 +177,9 @@ via your secret manager.
 ## Notes & limitations
 
 - Release **matching is heuristic** — DC filenames carry no structured metadata.
+- **Don't expose these ports to the internet.** The bridge assumes a trusted LAN.
+  Set `WEBHOOK_TOKEN` (and `QBIT_USER`/`QBIT_PASS` for the arr profile) if the
+  ports are reachable by anything you don't control.
 - Requires **FulDC++** specifically (it exposes the `auto_search` / `rss` core API
   modules that the upstream AirDC++ webclient does not).
 - Roadmap: full Radarr/Sonarr integration via a Torznab indexer + a

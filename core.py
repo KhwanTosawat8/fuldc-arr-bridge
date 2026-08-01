@@ -9,10 +9,34 @@ Hybrid strategy:
 
 from __future__ import annotations
 
-from fuldc_client import FulDCClient
+import re
+
+from fuldc_client import PRIO_HIGH, FulDCClient
 from ranker import Prefs, rank, search_queries, strip_leading_article, scene_title
 
 BAD_SOURCE = "cam camrip ts telesync tc telecine hdcam screener sample workprint"
+
+# One-shot AutoSearch items (a specific movie or season) stop searching after
+# this long. Without it an abandoned request searches the hubs forever. The
+# %[inc] episode monitor is deliberately exempt — an ongoing show has no end.
+AUTOSEARCH_TTL_DAYS = 60
+
+# characters Windows forbids in a path component, plus control chars
+_UNSAFE_COMPONENT = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_component(name: str) -> str:
+    """Make an untrusted string safe to use as ONE folder name.
+
+    The show name comes straight off the Seerr webhook, i.e. off the network —
+    without this, a subject like '..\\..\\Users\\Public (2020)' would walk the
+    download target out of DC_ROOT and write anywhere on the FulDC++ host.
+    Stripping the separators kills traversal; stripping leading/trailing dots
+    kills the '..' and '.' components themselves.
+    """
+    cleaned = _UNSAFE_COMPONENT.sub(" ", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:120].strip() or "unknown"
 
 
 def resolve_target(kind: str, title: str, series: str | None,
@@ -21,13 +45,16 @@ def resolve_target(kind: str, title: str, series: str | None,
                    series_dir: str | None = None) -> str:
     """Windows target path on the FulDC++ host. Users set their own share root
     via DC_ROOT (e.g. D:\\Media), or override the movie/TV folders directly with
-    MOVIES_DIR / SERIES_DIR for non-standard layouts."""
+    MOVIES_DIR / SERIES_DIR for non-standard layouts.
+
+    dc_root / movies_dir / series_dir / explicit are operator config and are
+    trusted; the show name is not (see safe_component)."""
     if explicit:
         return explicit
     root = dc_root.rstrip("\\/")
     if kind == "series":
         base = (series_dir or f"{root}\\series").rstrip("\\/")
-        show = (series or title).strip()
+        show = safe_component(series or title)
         p = f"{base}\\{show}\\"
         return p + f"S{season:02d}\\" if season else p
     md = (movies_dir or f"{root}\\movies").rstrip("\\/")
@@ -43,12 +70,15 @@ def _queries(title: str, year: int | None, kind: str, season: int | None) -> lis
 
 def run_search(client: FulDCClient, title: str, year: int | None,
                wait: float = 10.0, log=print, kind: str = "movie",
-               season: int | None = None):
+               season: int | None = None, priority: int = PRIO_HIGH):
     """Try fallback queries until one returns results. Returns (iid, results);
-    iid may be None. Closes instances that yielded nothing."""
+    iid may be None. Closes instances that yielded nothing.
+
+    Pass PRIO_LOW for background/automated polling so those searches are the
+    ones shed when the client's search queue backs up."""
     for q in _queries(title, year, kind, season):
         log(f"# search {q!r}")
-        iid, results = client.search(q, wait=wait)
+        iid, results = client.search(q, wait=wait, priority=priority)
         if results:
             return iid, results
         client.close(iid)
@@ -90,19 +120,56 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
     matcher = autosearch_matcher(title, year, kind, season)
     if prefs.require_quality:
         matcher = f"{matcher} {prefs.require_quality[0]}"
-    item = client.create_autosearch(matcher, target_directory=target, excluded=BAD_SOURCE)
+    item = client.create_autosearch(matcher, target_directory=target,
+                                    excluded=BAD_SOURCE,
+                                    expire_days=AUTOSEARCH_TTL_DAYS)
     return {"mode": "autosearch", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}
+
+
+def grab_tv_season(client: FulDCClient, show: str, season: int, *,
+                   prefs: Prefs | None = None, dc_root: str = "S:\\dc",
+                   movies_dir: str | None = None, series_dir: str | None = None,
+                   quality: str | None = None, wait: float = 10.0,
+                   log=print) -> dict:
+    """Season request: grab a season pack now if one is shared, otherwise fall
+    back to the %[inc] per-episode monitor.
+
+    The monitor alone never picks up an already-complete older season until its
+    next scheduled run, and it skips the season-pack preference in the ranker —
+    so try a real search first, exactly like the movie path does."""
+    prefs = prefs or Prefs()
+    target = resolve_target("series", show, None, dc_root, None, season,
+                            movies_dir, series_dir)
+    iid, results = run_search(client, show, None, wait, log, "series", season)
+    if results:
+        cands = rank(results, show, None, prefs, kind="series")
+        if cands:
+            best = cands[0]
+            info = client.download_result(iid, best.result["id"], target, name=best.release)
+            client.close(iid)
+            log(f"# season pack {best.release!r} -> {target}")
+            return {"mode": "download", "release": best.release, "score": best.score,
+                    "bundle_id": info.get("bundle_id"), "target": target, "season": season}
+        client.close(iid)
+    elif iid is not None:
+        client.close(iid)
+    return monitor_tv_season(client, show, season, dc_root=dc_root,
+                             movies_dir=movies_dir, series_dir=series_dir,
+                             quality=quality, log=log)
 
 
 def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
                       dc_root: str = "S:\\dc", movies_dir: str | None = None,
                       series_dir: str | None = None, quality: str | None = None,
-                      log=print) -> dict:
+                      first_episode: int = 1, log=print) -> dict:
     """Create a persistent per-episode AutoSearch for an ongoing season using the
     AirDC++ %[inc] increment token — grabs each episode as it appears (existing
     and future). This is the Sonarr-style 'monitor an airing show' behavior,
     done natively by FulDC++. remove_after_hit stays False so it keeps going.
+
+    use_params=True is what actually turns on %[inc] expansion; without it the
+    token is searched for literally and the monitor silently never matches.
     """
     target = resolve_target("series", show, None, dc_root, None, season,
                             movies_dir, series_dir)
@@ -110,7 +177,9 @@ def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
     q = f" {quality}" if quality else ""
     matcher = f"{base} S{season:02d}E%[inc]{q}"
     item = client.create_autosearch(matcher, target_directory=target,
-                                    excluded=BAD_SOURCE, remove_after_hit=False)
-    log(f"# monitor {matcher!r} -> {target}")
+                                    excluded=BAD_SOURCE, remove_after_hit=False,
+                                    use_params=True, cur_number=first_episode,
+                                    max_number=0, number_length=2)
+    log(f"# monitor {matcher!r} (from E{first_episode:02d}) -> {target}")
     return {"mode": "monitor", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}

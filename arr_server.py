@@ -10,14 +10,17 @@ Radarr/Sonarr config:
   Download client (qBittorrent): host <host>, port 9117
 
 Env: FULDC_URL, FULDC_USER, FULDC_PASS, DC_ROOT, MOVIES_DIR, SERIES_DIR,
-     TORZNAB_APIKEY, ARR_PORT (default 9117).
+     TORZNAB_APIKEY (required), QBIT_USER / QBIT_PASS (optional download-client
+     credentials), ARR_PORT (default 9117).
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
+import secrets
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -26,18 +29,21 @@ from ranker import Prefs
 import torznab
 import qbit
 
+# Session id handed out by /api/v2/auth/login. Random per process so a stale
+# cookie from a previous run can't drive this one.
+_SID = secrets.token_hex(16)
+
 
 def client() -> FulDCClient:
-    return FulDCClient(os.environ.get("FULDC_URL", "http://mgmt:5600"),
+    return FulDCClient(os.environ.get("FULDC_URL", "http://host.docker.internal:5600"),
                        os.environ.get("FULDC_USER", "admin"),
                        os.environ["FULDC_PASS"])
 
 
 def _apikey_ok(params: dict) -> bool:
+    # TORZNAB_APIKEY is required at startup, so `want` is always non-empty here
     want = os.environ.get("TORZNAB_APIKEY", "")
-    if not want:
-        return True   # no key configured = open (dev only)
-    return params.get("apikey", [""])[0] == want
+    return hmac.compare_digest(params.get("apikey", [""])[0], want)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -73,6 +79,19 @@ class Handler(BaseHTTPRequestHandler):
             return fields
         return {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8", "replace")).items()}
 
+    def _qbit_authed(self) -> bool:
+        """Radarr/Sonarr log in once and then send the SID cookie. If no
+        QBIT_USER/QBIT_PASS is configured we stay open (the original behaviour,
+        for LAN-only setups); when they are set, every call must carry the SID."""
+        if not os.environ.get("QBIT_PASS"):
+            return True
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "SID" and hmac.compare_digest(v, _SID):
+                return True
+        return False
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
@@ -80,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/torznab/api", "/api"):
             return self._torznab(params)
         if path.startswith("/api/v2/"):
+            # version probes run before login, everything else needs a session
+            if path not in ("/api/v2/app/version", "/api/v2/app/webapiVersion") \
+                    and not self._qbit_authed():
+                return self._send(403, b"Forbidden", "text/plain")
             return self._qbit_get(path)
         if path in ("", "/health"):
             return self._send(200, b"fuldc-arr-bridge arr server up", "text/plain")
@@ -88,11 +111,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/")
         if path == "/api/v2/auth/login":
+            f = self._form()
+            want_pass = os.environ.get("QBIT_PASS", "")
+            if want_pass:
+                want_user = os.environ.get("QBIT_USER", "admin")
+                ok = (hmac.compare_digest(f.get("username", ""), want_user)
+                      and hmac.compare_digest(f.get("password", ""), want_pass))
+                if not ok:
+                    print(f"[qbit] failed login from {self.client_address[0]}", flush=True)
+                    return self._send(200, b"Fails.", "text/plain")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            self.send_header("Set-Cookie", "SID=fuldc-arr-bridge; HttpOnly; path=/")
+            self.send_header("Set-Cookie", f"SID={_SID}; HttpOnly; path=/")
             self.end_headers()
             return self.wfile.write(b"Ok.")
+        if not self._qbit_authed():
+            self._read_body()
+            return self._send(403, b"Forbidden", "text/plain")
         if path == "/api/v2/torrents/add":
             f = self._form()
             urls = [u for u in re.split(r"[\r\n]+", f.get("urls", "")) if u.strip()]
@@ -160,7 +195,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    import sys
     port = int(os.environ.get("ARR_PORT", "9117"))
+    if not os.environ.get("TORZNAB_APIKEY"):
+        sys.exit("TORZNAB_APIKEY is not set. This port can queue downloads on "
+                 "your box — pick any random string, set it here and use the "
+                 "same value as the indexer API key in Radarr/Sonarr.")
+    if not os.environ.get("QBIT_PASS"):
+        print("! QBIT_PASS is not set — the download-client endpoints accept "
+              "any caller. Set QBIT_USER/QBIT_PASS and use them in the "
+              "Radarr/Sonarr qBittorrent client config.", flush=True)
     print(f"fuldc-arr-bridge arr server listening on :{port} "
           f"(torznab /torznab/api, qbit /api/v2)", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

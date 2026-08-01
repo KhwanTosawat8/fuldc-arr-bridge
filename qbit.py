@@ -77,7 +77,11 @@ def _reacquire(client: FulDCClient, info: dict):
         if iid is not None:
             client.close(iid)
         return None
-    target = resolve_target(info["kind"], info["pattern"], None,
+    # For series the folder name should be the show, not Radarr's raw query
+    # string (which carries season/quality terms) — fall back to the pattern
+    # only if the indexer didn't record a show name.
+    show = info.get("show") or info["pattern"]
+    target = resolve_target(info["kind"], show, None,
                             os.environ.get("DC_ROOT", "S:\\dc"), None,
                             info.get("season"), os.environ.get("MOVIES_DIR"),
                             os.environ.get("SERIES_DIR"))
@@ -93,11 +97,22 @@ def add(client: FulDCClient, urls: list[str], category: str) -> None:
             continue
         info = store.get(h)
         if not info:
-            print(f"[qbit] add: unknown magnet {h[:12]} (no stored search) — skipping", flush=True)
+            # store is in-memory, so a restart loses the mapping. Surface it as
+            # a failed torrent instead of accepting silently — otherwise Radarr
+            # waits forever on something that will never appear.
+            print(f"[qbit] add: unknown magnet {h[:12]} (no stored search) — "
+                  f"reporting as failed", flush=True)
+            _torrents[h] = {"name": h[:12], "category": category or "", "size": 0,
+                            "save_path": "", "added_on": int(time.time()),
+                            "bundle_id": None, "failed": True}
             continue
         res = _reacquire(client, info)
         if not res:
             print(f"[qbit] add: {info['release']!r} not found on hubs right now", flush=True)
+            _torrents[h] = {"name": info["release"], "category": category or "",
+                            "size": info["size"], "save_path": "",
+                            "added_on": int(time.time()), "bundle_id": None,
+                            "failed": True}
             continue
         bundle_id, target = res
         _torrents[h] = {"name": info["release"], "category": category or "",
@@ -110,7 +125,9 @@ def _state(bundle: dict | None):
     if not bundle:
         return "downloading", 0.0
     sid = (bundle.get("status") or {}).get("id")
-    if sid in FulDCClient.DONE_OK:
+    # "downloaded" counts: the data is on disk, validation/sharing is
+    # post-processing, so Radarr can import already.
+    if sid in FulDCClient.DONE_ON_DISK:
         return "pausedUP", 1.0          # complete -> Radarr imports
     if sid in FulDCClient.DONE_BAD:
         return "error", 0.0
@@ -123,8 +140,11 @@ def info(client: FulDCClient, category: str | None = None) -> list[dict]:
     for h, t in list(_torrents.items()):
         if category and t["category"] != category:
             continue
-        bundle = client.get_bundle(t["bundle_id"]) if t.get("bundle_id") else None
-        state, progress = _state(bundle)
+        if t.get("failed"):
+            state, progress, bundle = "error", 0.0, None
+        else:
+            bundle = client.get_bundle(t["bundle_id"]) if t.get("bundle_id") else None
+            state, progress = _state(bundle)
         content_path = (bundle or {}).get("target") or t["save_path"]
         out.append({
             "hash": h, "name": t["name"], "size": t["size"],
