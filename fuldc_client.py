@@ -15,6 +15,22 @@ import urllib.request
 from typing import Any
 
 
+def _decode(raw: bytes) -> str:
+    """Decode an API response body without ever raising.
+
+    A bare .decode() assumes UTF-8. FulDC++ is a Windows application serving
+    filenames that came off the hubs, so a single cp1252 byte — an å, ä or ö
+    from a Swedish release — produced UnicodeDecodeError. That is not
+    FulDCError, so it escaped every caller's handler and killed the request
+    thread outright. Replacing undecodable bytes degrades one title rather
+    than losing the whole request.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace")
+
+
 class FulDCError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
@@ -47,10 +63,10 @@ class FulDCClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                raw = r.read().decode()
+                raw = _decode(r.read())
                 return r.status, (json.loads(raw) if raw.strip() else None)
         except urllib.error.HTTPError as e:
-            body_txt = e.read().decode()
+            body_txt = _decode(e.read())
             try:
                 return e.code, json.loads(body_txt or "{}")
             except json.JSONDecodeError:
