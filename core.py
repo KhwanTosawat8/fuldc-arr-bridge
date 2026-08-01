@@ -89,3 +89,24 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
     item = client.create_autosearch(matcher, target_directory=target, excluded=BAD_SOURCE)
     return {"mode": "autosearch", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}
+
+
+def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
+                      dc_root: str = "S:\\dc", movies_dir: str | None = None,
+                      series_dir: str | None = None, quality: str | None = None,
+                      log=print) -> dict:
+    """Create a persistent per-episode AutoSearch for an ongoing season using the
+    AirDC++ %[inc] increment token — grabs each episode as it appears (existing
+    and future). This is the Sonarr-style 'monitor an airing show' behavior,
+    done natively by FulDC++. remove_after_hit stays False so it keeps going.
+    """
+    target = resolve_target("series", show, None, dc_root, None, season,
+                            movies_dir, series_dir)
+    base = strip_leading_article(show)
+    q = f" {quality}" if quality else ""
+    matcher = f"{base} S{season:02d}E%[inc]{q}"
+    item = client.create_autosearch(matcher, target_directory=target,
+                                    excluded=BAD_SOURCE, remove_after_hit=False)
+    log(f"# monitor {matcher!r} -> {target}")
+    return {"mode": "monitor", "matcher": matcher,
+            "autosearch_id": item.get("id"), "target": target, "season": season}

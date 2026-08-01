@@ -75,6 +75,7 @@ class Prefs:
     prefer_quality: list[str] = field(default_factory=lambda: ["1080p", "720p", "2160p"])
     prefer_codec: list[str] = field(default_factory=lambda: ["x265", "x264"])
     prefer_lang: list[str] = field(default_factory=list)   # e.g. ["swesub"]
+    require_quality: list[str] = field(default_factory=list)  # e.g. ["1080p"]; empty = any
     min_size: int = 700 * 1024**2          # 700 MB
     max_size: int = 100 * 1024**3          # 100 GB
     min_users: int = 1
@@ -156,5 +157,8 @@ def rank(results: list[dict], title: str, year: int | None, prefs: Prefs,
     cands = [score_result(r, title, year, prefs, kind) for r in results]
     if not include_dupes:
         cands = [c for c in cands if not c.result.get("dupe")]
+    if prefs.require_quality:
+        want = [q.lower() for q in prefs.require_quality]
+        cands = [c for c in cands if any(q in c.release.lower() for q in want)]
     cands.sort(key=lambda c: c.score, reverse=True)
     return cands
