@@ -12,7 +12,7 @@ import urllib.parse
 from email.utils import formatdate
 from xml.sax.saxutils import escape
 
-from fuldc_client import FulDCClient
+from fuldc_client import PRIO_LOW, FulDCClient
 from ranker import Prefs, rank
 from core import run_search
 import store
@@ -52,7 +52,11 @@ def search_items(client: FulDCClient, *, query: str, kind: str,
     """Run a DC search, rank, remember each result, and return Torznab items."""
     if not query.strip():
         return []   # RSS sync with no query — nothing to search on DC
-    iid, results = run_search(client, query, None, wait=8, kind=kind, season=season)
+    # Indexer traffic is overwhelmingly Radarr/Sonarr's periodic RSS sync rather
+    # than a person waiting, so search at background priority — these are the
+    # ones that *should* be dropped when the client's search queue is loaded.
+    iid, results = run_search(client, query, None, wait=8, kind=kind,
+                              season=season, priority=PRIO_LOW)
     cands = rank(results, query, None, prefs, kind=kind)
     if iid is not None:
         client.close(iid)
