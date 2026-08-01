@@ -40,8 +40,8 @@ def client_from_env() -> FulDCClient:
     pw = os.environ.get("FULDC_PASS")
     if not pw:
         sys.exit("FULDC_PASS not set")
-    return FulDCClient(os.environ.get("FULDC_URL", "http://mgmt:5600"),
-                       os.environ.get("FULDC_USER", "peter"), pw)
+    return FulDCClient(os.environ.get("FULDC_URL", "http://host.docker.internal:5600"),
+                       os.environ.get("FULDC_USER", "admin"), pw)
 
 
 def prefs_from_args(a) -> Prefs:
@@ -84,10 +84,11 @@ def do_grab(a) -> None:
     dc_root = os.environ.get("DC_ROOT", "S:\\dc")
     movies_dir = os.environ.get("MOVIES_DIR")
     series_dir = os.environ.get("SERIES_DIR")
+    season = getattr(a, "season", None)
     target = resolve_target(a.kind, a.title, a.series, dc_root, a.target,
-                            None, movies_dir, series_dir)
+                            season, movies_dir, series_dir)
     if not a.grab:
-        iid, results = run_search(c, a.title, a.year, a.wait)
+        iid, results = run_search(c, a.title, a.year, a.wait, kind=a.kind, season=season)
         if iid is None:
             print(f"# nothing shared now — would create an AutoSearch item → {target}")
             return
@@ -101,8 +102,9 @@ def do_grab(a) -> None:
         print("\n# DRY RUN — re-run with --grab to actually queue this download")
         return
     res = hybrid_grab(c, a.title, a.year, kind=a.kind, series=a.series,
-                      prefs=prefs, dc_root=dc_root, movies_dir=movies_dir,
-                      series_dir=series_dir, target=target, wait=a.wait)
+                      season=season, prefs=prefs, dc_root=dc_root,
+                      movies_dir=movies_dir, series_dir=series_dir,
+                      target=target, wait=a.wait)
     if res["mode"] == "autosearch":
         print(f"# not shared right now → created AutoSearch item id={res['autosearch_id']} "
               f"matcher={res['matcher']!r} target={res['target']}")
@@ -122,7 +124,7 @@ def do_grab(a) -> None:
     final = c.wait_bundle(bundle_id, on_status=on_status)
     fsid = (final or {}).get("status", {}).get("id")
     print(f"# final status: {fsid}")
-    if a.notify and fsid in c.DONE_OK:
+    if a.notify and fsid in c.DONE_ON_DISK:
         from notify import refresh
         refresh(a.kind)
 
@@ -142,6 +144,9 @@ def main() -> None:
             s.add_argument("--show-dupes", action="store_true")
         else:
             s.add_argument("--kind", choices=["movie", "series"], default="movie")
+            s.add_argument("--season", type=int,
+                           help="season number (series only) — searches S<NN> and "
+                                "saves into <Show>\\S<NN>\\")
             s.add_argument("--series", help="series folder name (defaults to title)")
             s.add_argument("--target", help="explicit Windows target dir (overrides DC_ROOT layout)")
             s.add_argument("--grab", action="store_true", help="actually queue the download")

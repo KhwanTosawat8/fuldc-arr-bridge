@@ -43,6 +43,11 @@ class FulDCClient:
                 return e.code, json.loads(body_txt or "{}")
             except json.JSONDecodeError:
                 return e.code, {"message": body_txt}
+        except (urllib.error.URLError, OSError) as e:
+            # connection refused / DNS / timeout — surface as our own error type
+            # so callers don't have to catch raw urllib exceptions
+            raise FulDCError(f"{method} {path}: cannot reach FulDC++ at "
+                             f"{self.base} ({e})") from e
 
     # --- generic ---------------------------------------------------------
     def system_info(self) -> dict:
@@ -95,9 +100,9 @@ class FulDCClient:
         (trailing backslash added). Returns {'bundle_id':..., 'merged':...}.
 
         File results return a bundle_info immediately. DIRECTORY results kick off
-        a filelist (directory) download first, so the bundle appears
-        asynchronously — we resolve it by matching the release `name` in the
-        queue (falling back to the directory_downloads list)."""
+        a filelist (directory) download first and return `directory_download_ids`,
+        so the bundle appears asynchronously — we poll exactly those ids until
+        one carries a bundle."""
         body: dict = {}
         if target_directory:
             td = target_directory.replace("/", "\\")
@@ -111,19 +116,25 @@ class FulDCClient:
         bi = data.get("bundle_info") or {}
         if bi.get("id"):
             return {"bundle_id": bi["id"], "merged": bi.get("merged")}
-        # directory download — resolve the bundle asynchronously
-        if name:
-            for _ in range(15):
+        # Directory result: the API hands back the ids of the directory downloads
+        # it started. Poll *those* — scanning the global list would happily pick
+        # up a concurrent grab's bundle instead of ours.
+        dd_ids = data.get("directory_download_ids") or []
+        for _ in range(15):
+            for dd_id in dd_ids:
+                qb = (self.get_directory_download(dd_id).get("queue_info") or {}).get("bundle") or {}
+                if qb.get("id"):
+                    return {"bundle_id": qb["id"], "merged": qb.get("merged")}
+            if name:
                 for b in self.list_bundles():
                     if b.get("name") == name:
                         return {"bundle_id": b["id"], "merged": True}
-                time.sleep(1)
-        _, dds = self._call("GET", "/filelists/directory_downloads")
-        for dd in (dds or []):
-            qb = (dd.get("queue_info") or {}).get("bundle") or {}
-            if qb.get("id"):
-                return {"bundle_id": qb["id"], "merged": qb.get("merged")}
+            time.sleep(1)
         return {"bundle_id": None, "raw": data}
+
+    def get_directory_download(self, dd_id) -> dict:
+        st, data = self._call("GET", f"/filelists/directory_downloads/{dd_id}")
+        return data or {} if st == 200 else {}
 
     def list_bundles(self, start: int = 0, count: int = 200) -> list[dict]:
         _, data = self._call("GET", f"/queue/bundles/{start}/{count}")
@@ -179,9 +190,12 @@ class FulDCClient:
         st, _ = self._call("POST", f"/auto_search/items/{item_id}/search")
         return st in (200, 204)
 
-    # terminal bundle statuses (best-effort; validated live during a real grab)
-    DONE_OK = {"completed", "shared"}
-    DONE_BAD = {"completion_validation_error", "hash_failed", "download_failed", "failed"}
+    # Bundle status ids, per QueueBundleUtils.cpp: new, queued, recheck,
+    # downloaded, download_error, completion_validation_running,
+    # completion_validation_error, completed, shared.
+    DONE_OK = {"completed", "shared"}           # finished and (re)shared
+    DONE_ON_DISK = DONE_OK | {"downloaded"}     # data is on disk; validation may still run
+    DONE_BAD = {"download_error", "completion_validation_error"}
 
     def wait_bundle(self, bundle_id: int, timeout: int = 3600, poll: int = 5,
                     on_status=None) -> dict | None:
@@ -200,7 +214,7 @@ class FulDCClient:
                 if on_status:
                     on_status(sid, b)
                 last = sid
-            if sid in self.DONE_OK or sid in self.DONE_BAD:
+            if sid in self.DONE_ON_DISK or sid in self.DONE_BAD:
                 return b
             _t.sleep(poll)
         return self.get_bundle(bundle_id)

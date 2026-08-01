@@ -27,9 +27,12 @@ def caps_xml() -> str:
 <caps>
   <server version="1.0" title="fuldc-arr-bridge"/>
   <limits max="100" default="50"/>
+  <!-- Only advertise what we actually implement: DC has no id-based lookup, so
+       claiming imdbid/tmdbid/tvdbid makes Radarr/Sonarr send id-only searches
+       (empty q) that can never return a result. -->
   <searching>
     <search available="yes" supportedParams="q"/>
-    <movie-search available="yes" supportedParams="q,imdbid,tmdbid"/>
+    <movie-search available="yes" supportedParams="q"/>
     <tv-search available="yes" supportedParams="q,season,ep"/>
   </searching>
   <categories>
@@ -60,7 +63,9 @@ def search_items(client: FulDCClient, *, query: str, kind: str,
         size = int(r.get("size") or 0)
         h = store.synthetic_hash(r)
         store.put(h, {
-            "pattern": query, "kind": kind, "season": season,
+            # `q` on a tvsearch is the bare show title — remember it so the
+            # download client files the release under the right folder
+            "pattern": query, "show": query, "kind": kind, "season": season,
             "release": c.release, "tth": r.get("tth") or "",
             "path": r.get("path") or "", "size": size,
         })
