@@ -15,6 +15,7 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -196,6 +197,35 @@ def _handle(payload: dict) -> None:
         _grab(title, year, kind="movie", movies_dir=mov_dir)
 
 
+# /health talks to FulDC++, so cache it: k8s probes every 10s and a readiness
+# check must not become a load source of its own.
+_HEALTH_TTL = 15.0
+_health_cache: tuple[float, bool, str] = (0.0, False, "")
+_health_lock = threading.Lock()
+
+
+def _fuldc_reachable() -> tuple[bool, str]:
+    """Is the configured FulDC++ actually answering?
+
+    The readiness answer has to depend on this. A probe that returns 200
+    regardless reports a pod as healthy with FULDC_PASS unset and the client
+    unreachable, which is how a broken deploy silently accepts and drops every
+    request."""
+    now = time.monotonic()
+    with _health_lock:
+        stamp, ok, detail = _health_cache
+        if now - stamp < _HEALTH_TTL:
+            return ok, detail
+    try:
+        info = client().system_info()
+        ok, detail = True, f"ok: FulDC++ {info.get('client_version', '?')}"
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, f"FulDC++ unreachable: {e}"
+    with _health_lock:
+        globals()["_health_cache"] = (now, ok, detail)
+    return ok, detail
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes = b"ok") -> None:
         self.send_response(code)
@@ -224,6 +254,13 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        if path == "/health":
+            ok, detail = _fuldc_reachable()
+            return self._send(200 if ok else 503, detail.encode())
+        # "/" stays an unconditional 200: it is the liveness answer, and a
+        # liveness probe that depends on FulDC++ would restart this process
+        # every time the client is restarted.
         self._send(200, b"fuldc-arr-bridge webhook up")
 
     def do_POST(self):
@@ -252,7 +289,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    import sys
     port = int(os.environ.get("PORT", "8080"))
+    # Fail at startup, not on the first webhook. Without this the service comes
+    # up, answers every health probe 200, and only whispers a KeyError into
+    # stdout once a real request arrives — by which point the request is lost.
+    if not os.environ.get("FULDC_PASS"):
+        sys.exit("FULDC_PASS is not set — the bridge cannot talk to FulDC++.")
+    if not os.environ.get("DC_ROOT"):
+        print("! DC_ROOT is not set; falling back to S:\\dc, which is probably "
+              "not where your share lives.", flush=True)
     if not os.environ.get("WEBHOOK_TOKEN"):
         print("! WEBHOOK_TOKEN is not set — anyone who can reach this port can "
               "queue downloads. Set it (and add ?token=… to the Seerr webhook "

@@ -4,6 +4,10 @@ LABEL org.opencontainers.image.source="https://github.com/Pete1979/fuldc-arr-bri
 LABEL org.opencontainers.image.description="Request movies & TV in Seerr/Jellyseerr/Overseerr and auto-download them over Direct Connect via FulDC++"
 LABEL org.opencontainers.image.licenses="MIT"
 
+# Not every log line goes through flush=True, and a buffered stdout means those
+# never reach `docker logs` at all — including the record of what was searched.
+ENV PYTHONUNBUFFERED=1
+
 # stdlib-only app — no pip install needed
 WORKDIR /app
 # webhook flow + CLI
