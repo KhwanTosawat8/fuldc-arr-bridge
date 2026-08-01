@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fuldc_client import FulDCClient
 from ranker import Prefs
-from core import hybrid_grab
+from core import hybrid_grab, monitor_tv_season
 
 APPROVED = {"MEDIA_APPROVED", "MEDIA_AUTO_APPROVED"}
 YEAR_RE = re.compile(r"\((\d{4})\)")
@@ -50,18 +50,42 @@ def requested_seasons(payload: dict) -> list[int]:
     return []
 
 
+def _prefs() -> Prefs:
+    p = Prefs()
+    q = os.environ.get("QUALITY", "").strip().lower()
+    if q:
+        p.require_quality = [q]
+        if q not in p.prefer_quality:
+            p.prefer_quality = [q] + p.prefer_quality
+    return p
+
+
 def _grab(title, year, *, kind, season=None):
     print(f"[grab] {title!r} ({year}) type={kind}" + (f" S{season:02d}" if season else ""),
           flush=True)
     try:
         res = hybrid_grab(client(), title, year, kind=kind, season=season,
-                          prefs=Prefs(), dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
+                          prefs=_prefs(), dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
                           movies_dir=os.environ.get("MOVIES_DIR"),
                           series_dir=os.environ.get("SERIES_DIR"),
                           log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
     except Exception as e:  # noqa: BLE001 - webhook must never crash the server
         print(f"[error] {title!r}: {e}", flush=True)
+
+
+def _monitor_tv(title, season):
+    q = os.environ.get("QUALITY", "").strip() or None
+    print(f"[grab] {title!r} series S{season:02d} (monitor %[inc])", flush=True)
+    try:
+        res = monitor_tv_season(client(), title, season,
+                                dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
+                                movies_dir=os.environ.get("MOVIES_DIR"),
+                                series_dir=os.environ.get("SERIES_DIR"),
+                                quality=q, log=lambda m: print(m, flush=True))
+        print(f"[done] {res}", flush=True)
+    except Exception as e:  # noqa: BLE001 - webhook must never crash the server
+        print(f"[error] {title!r} S{season}: {e}", flush=True)
 
 
 def handle(payload: dict) -> None:
@@ -76,8 +100,12 @@ def handle(payload: dict) -> None:
         print("[skip] empty title", flush=True)
         return
     if mtype == "tv":
-        for season in (requested_seasons(payload) or [None]):
-            _grab(title, year, kind="series", season=season)
+        seasons = requested_seasons(payload)
+        if seasons:
+            for season in seasons:
+                _monitor_tv(title, season)   # %[inc] ongoing-episode monitor
+        else:
+            _grab(title, year, kind="series")   # no season info -> best-effort grab
     else:
         _grab(title, year, kind="movie")
 
