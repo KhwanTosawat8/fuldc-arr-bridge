@@ -14,7 +14,7 @@ from xml.sax.saxutils import escape
 
 from fuldc_client import PRIO_LOW, FulDCClient
 from ranker import Prefs, rank
-from core import run_search
+from core import searched
 import store
 
 MOVIE_CAT = 2000
@@ -48,18 +48,17 @@ def _magnet(h: str, title: str, size: int) -> str:
 
 
 def search_items(client: FulDCClient, *, query: str, kind: str,
-                 season: int | None, limit: int, prefs: Prefs) -> list[dict]:
+                 season: int | None, limit: int, prefs: Prefs,
+                 wait: float = 8.0) -> list[dict]:
     """Run a DC search, rank, remember each result, and return Torznab items."""
     if not query.strip():
         return []   # RSS sync with no query — nothing to search on DC
     # Indexer traffic is overwhelmingly Radarr/Sonarr's periodic RSS sync rather
     # than a person waiting, so search at background priority — these are the
     # ones that *should* be dropped when the client's search queue is loaded.
-    iid, results = run_search(client, query, None, wait=8, kind=kind,
-                              season=season, priority=PRIO_LOW)
-    cands = rank(results, query, None, prefs, kind=kind)
-    if iid is not None:
-        client.close(iid)
+    with searched(client, query, None, wait=wait, kind=kind, season=season,
+                  priority=PRIO_LOW) as (_iid, results):
+        cands = rank(results, query, None, prefs, kind=kind)
 
     items = []
     for c in cands[:limit]:
