@@ -84,8 +84,12 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
         client.close(iid)
     elif iid is not None:
         client.close(iid)
-    # nothing available now -> persistent AutoSearch
+    # nothing available now -> persistent AutoSearch. Bake the required quality
+    # into the search string so FulDC++ only grabs matching releases (the
+    # server-side AutoSearch can't reuse the ranker's quality filter).
     matcher = autosearch_matcher(title, year, kind, season)
+    if prefs.require_quality:
+        matcher = f"{matcher} {prefs.require_quality[0]}"
     item = client.create_autosearch(matcher, target_directory=target, excluded=BAD_SOURCE)
     return {"mode": "autosearch", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}
