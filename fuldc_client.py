@@ -87,25 +87,33 @@ class FulDCClient:
         st, inst = self._call("POST", "/search")
         if st != 200:
             raise FulDCError(f"create search instance http {st}: {inst}", st)
+        if not isinstance(inst, dict) or inst.get("id") is None:
+            raise FulDCError(f"create search instance: unexpected body {inst!r}", st)
         iid = inst["id"]
-        st, data = self._call("POST", f"/search/{iid}/hub_search",
-                              {"priority": priority, "query": {"pattern": pattern}})
-        if st != 200:
+        # From here on the instance exists server-side and lives until we DELETE
+        # it, so nothing may escape without closing it.
+        try:
+            st, data = self._call("POST", f"/search/{iid}/hub_search",
+                                  {"priority": priority, "query": {"pattern": pattern}})
+            if st != 200:
+                # 503 = "Search queue overflow": the client's outgoing search
+                # queue is backed up past 20 minutes. Caller decides whether to
+                # back off.
+                raise FulDCError(f"hub_search http {st}: {data}", st)
+            deadline = time.time() + wait
+            last_count, stable_since = -1, time.time()
+            while time.time() < deadline:
+                time.sleep(poll)
+                _, cur = self._call("GET", f"/search/{iid}")
+                count = (cur or {}).get("result_count", 0)
+                if count != last_count:
+                    last_count, stable_since = count, time.time()
+                elif count > 0 and (time.time() - stable_since) >= plateau:
+                    break
+            _, results = self._call("GET", f"/search/{iid}/results/0/200")
+        except BaseException:
             self.close(iid)
-            # 503 = "Search queue overflow": the client's outgoing search queue
-            # is backed up past 20 minutes. Caller decides whether to back off.
-            raise FulDCError(f"hub_search http {st}: {data}", st)
-        deadline = time.time() + wait
-        last_count, stable_since = -1, time.time()
-        while time.time() < deadline:
-            time.sleep(poll)
-            _, cur = self._call("GET", f"/search/{iid}")
-            count = (cur or {}).get("result_count", 0)
-            if count != last_count:
-                last_count, stable_since = count, time.time()
-            elif count > 0 and (time.time() - stable_since) >= plateau:
-                break
-        _, results = self._call("GET", f"/search/{iid}/results/0/200")
+            raise
         return iid, (results or [])
 
     def close(self, instance_id: int) -> None:

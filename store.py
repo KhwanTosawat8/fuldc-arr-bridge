@@ -12,10 +12,13 @@ Radarr/Sonarr simply re-query on their next RSS/search cycle, so it self-heals.
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections import OrderedDict
 
 _MAX = 5000
 _store: "OrderedDict[str, dict]" = OrderedDict()
+# Written from Torznab search threads, read from qBittorrent add threads.
+_lock = threading.Lock()
 
 
 def synthetic_hash(result: dict) -> str:
@@ -27,11 +30,22 @@ def synthetic_hash(result: dict) -> str:
 
 
 def put(h: str, info: dict) -> None:
-    _store[h] = info
-    _store.move_to_end(h)
-    while len(_store) > _MAX:
-        _store.popitem(last=False)
+    with _lock:
+        _store[h] = info
+        _store.move_to_end(h)
+        while len(_store) > _MAX:
+            _store.popitem(last=False)
 
 
 def get(h: str) -> dict | None:
-    return _store.get(h)
+    """Look up a release, promoting it to the newest end.
+
+    Without the promotion this is insertion-ordered, not least-recently-used:
+    a couple of indexers RSS-syncing every 15 minutes evict the map within
+    hours, so a release Radarr found in the morning fails as "unknown magnet"
+    when the user grabs it that evening — with no restart involved."""
+    with _lock:
+        info = _store.get(h)
+        if info is not None:
+            _store.move_to_end(h)
+        return info

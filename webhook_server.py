@@ -11,15 +11,16 @@ Env: FULDC_URL, FULDC_USER, FULDC_PASS, DC_ROOT, PORT (default 8080),
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import re
 import threading
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fuldc_client import FulDCClient
+from httputil import body_too_large, read_body, secure_equal
 from ranker import Prefs
 from core import grab_tv_season, hybrid_grab
 
@@ -34,22 +35,41 @@ def client() -> FulDCClient:
 
 
 def parse(payload: dict):
-    nt = payload.get("notification_type", "")
-    media = payload.get("media") or {}
-    mtype = media.get("media_type", "")
-    subject = (payload.get("subject") or "").strip()
+    """Pull (notification_type, media_type, title, year) out of a Seerr payload.
+
+    Every field is defensive: the payload template is user-editable in Seerr's
+    settings, all values arrive as strings, and `media` is nulled out entirely
+    when the notification has no media attached (issue comments, test pings).
+    """
+    nt = str(payload.get("notification_type") or "")
+    media = payload.get("media")
+    media = media if isinstance(media, dict) else {}
+    mtype = str(media.get("media_type") or "").lower()
+    subject = str(payload.get("subject") or "").strip()
     m = YEAR_RE.search(subject)
     year = int(m.group(1)) if m else None
     title = (YEAR_RE.sub("", subject).strip(" -") if m else subject).strip()
     return nt, mtype, title, year
 
 
+# A season number outside this range is a parse artefact (a year, an id), not a
+# season. Accepting one creates a %[inc] monitor that can never match.
+MAX_SEASON = 100
+
+
 def requested_seasons(payload: dict) -> list[int]:
     """Seerr puts requested seasons in the `extra` array as
-    {"name": "Requested Seasons", "value": "1, 2"}."""
+    {"name": "Requested Seasons", "value": "1, 2"}. Season 0 is Specials and is
+    legitimate; anything above MAX_SEASON is junk."""
     for e in payload.get("extra") or []:
+        if not isinstance(e, dict):
+            continue
         if str(e.get("name", "")).lower().startswith("requested season"):
-            return sorted({int(x) for x in re.findall(r"\d+", str(e.get("value", "")))})
+            found = {int(x) for x in re.findall(r"\d+", str(e.get("value", "")))}
+            good = sorted(n for n in found if 0 <= n <= MAX_SEASON)
+            for bad in sorted(found - set(good)):
+                print(f"[skip] implausible season number {bad}", flush=True)
+            return good
     return []
 
 
@@ -90,8 +110,8 @@ def _grab(title, year, *, kind, season=None):
                           log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
         _after_download(c, res, kind)
-    except Exception as e:  # noqa: BLE001 - webhook must never crash the server
-        print(f"[error] {title!r}: {e}", flush=True)
+    except Exception:  # noqa: BLE001 - webhook must never crash the server
+        print(f"[error] {title!r}:\n{traceback.format_exc()}", flush=True)
 
 
 def _grab_season(title, season):
@@ -106,14 +126,30 @@ def _grab_season(title, season):
                              quality=q, log=lambda m: print(m, flush=True))
         print(f"[done] {res}", flush=True)
         _after_download(c, res, "series")
-    except Exception as e:  # noqa: BLE001 - webhook must never crash the server
-        print(f"[error] {title!r} S{season}: {e}", flush=True)
+    except Exception:  # noqa: BLE001 - webhook must never crash the server
+        print(f"[error] {title!r} S{season}:\n{traceback.format_exc()}", flush=True)
 
 
 def handle(payload: dict) -> None:
+    # This runs on a detached thread after the 200 was already sent, so an
+    # escaping exception would vanish into a bare threading traceback with no
+    # record of which request died.
+    try:
+        _handle(payload)
+    except Exception:  # noqa: BLE001 - a bad payload must not kill the thread silently
+        print(f"[error] unhandled webhook failure for "
+              f"subject={payload.get('subject')!r}:\n{traceback.format_exc()}", flush=True)
+
+
+def _handle(payload: dict) -> None:
     nt, mtype, title, year = parse(payload)
     if nt not in APPROVED:
         print(f"[skip] notification_type={nt}", flush=True)
+        return
+    if mtype not in ("movie", "tv"):
+        # Never guess. Falling through to the movie branch on an unknown type
+        # is how a TV show ends up in DC_ROOT\movies\.
+        print(f"[skip] unsupported media_type={mtype!r}", flush=True)
         return
     if os.environ.get("MOVIES_ONLY", "0") == "1" and mtype != "movie":
         print(f"[skip] media_type={mtype} (movies only)", flush=True)
@@ -141,30 +177,46 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         """Optional shared secret. This endpoint queues downloads on your box,
-        so if WEBHOOK_TOKEN is set we require it as ?token=… or X-Webhook-Token.
-        Unset = open (LAN-only deployments); a warning is printed at startup."""
+        so if WEBHOOK_TOKEN is set we require it.
+
+        Overseerr can only send a single configured `Authorization` header, so
+        that is accepted alongside Jellyseerr's custom X-Webhook-Token and the
+        ?token= query form. Unset = open (LAN-only); warned about at startup.
+        """
         want = os.environ.get("WEBHOOK_TOKEN", "")
         if not want:
             return True
-        got = self.headers.get("X-Webhook-Token", "")
-        if not got:
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            got = q.get("token", [""])[0]
-        return hmac.compare_digest(got, want)
+        auth = self.headers.get("Authorization", "")
+        for candidate in (self.headers.get("X-Webhook-Token", ""),
+                          auth[7:] if auth[:7].lower() == "bearer " else auth,
+                          urllib.parse.parse_qs(
+                              urllib.parse.urlparse(self.path).query).get("token", [""])[0]):
+            if candidate and secure_equal(candidate, want):
+                return True
+        return False
 
     def do_GET(self):
         self._send(200, b"fuldc-arr-bridge webhook up")
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n) if n else b"{}"
+        # Authorize before buffering: an unauthenticated caller must not be
+        # able to make us allocate on the strength of a Content-Length header.
         if not self._authorized():
+            read_body(self, 0)
             print(f"[deny] unauthorized webhook from {self.client_address[0]}", flush=True)
             return self._send(401, b"unauthorized")
+        if body_too_large(self):
+            return self._send(413, b"payload too large")
+        raw = read_body(self)
         try:
             payload = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             payload = {}
+        # The payload template is user-editable in Seerr, so anything can
+        # arrive here — including a JSON array or a bare string.
+        if not isinstance(payload, dict):
+            print(f"[skip] payload is {type(payload).__name__}, not an object", flush=True)
+            return self._send(200, b"ignored")
         self._send(200, b"accepted")
         threading.Thread(target=handle, args=(payload,), daemon=True).start()
 
@@ -173,7 +225,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    import sys
     port = int(os.environ.get("PORT", "8080"))
+    # Fail at startup, not on the first webhook. Without this the service comes
+    # up, answers every health probe 200, and only whispers a KeyError into
+    # stdout once a request actually arrives.
+    if not os.environ.get("FULDC_PASS"):
+        sys.exit("FULDC_PASS is not set — the bridge cannot talk to FulDC++.")
+    if not os.environ.get("DC_ROOT"):
+        print("! DC_ROOT is not set; falling back to S:\\dc, which is probably "
+              "not where your share lives.", flush=True)
     if not os.environ.get("WEBHOOK_TOKEN"):
         print("! WEBHOOK_TOKEN is not set — anyone who can reach this port can "
               "queue downloads. Set it (and add ?token=… to the Seerr webhook "

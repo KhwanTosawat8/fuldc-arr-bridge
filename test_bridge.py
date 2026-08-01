@@ -11,10 +11,20 @@ working-looking AutoSearch item that silently never matches anything.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
+import re
 import unittest
+import unittest.mock
+
+os.environ.setdefault("FULDC_PASS", "test")
 
 import core
+import httputil
 import ranker
+import store
+import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
 
 
@@ -32,8 +42,9 @@ class FakeClient(FulDCClient):
         if key in self.responses:
             r = self.responses[key]
             return r.pop(0) if isinstance(r, list) else r
-        if "/results/" in path or path.endswith("/items"):
-            return 200, []          # list-shaped endpoints
+        if ("/results/" in path or path.endswith("/items")
+                or re.search(r"/\d+/\d+$", path)):
+            return 200, []          # list- and range-shaped endpoints
         return 200, {"id": 1}
 
     def body_for(self, method, path) -> dict:
@@ -41,6 +52,86 @@ class FakeClient(FulDCClient):
             if m == method and p == path:
                 return b or {}
         raise AssertionError(f"no {method} {path} in {[(m, p) for m, p, _ in self.calls]}")
+
+    # --- search-instance leak accounting ---------------------------------
+    # A FulDC++ search instance lives server-side until DELETEd (or until the
+    # session dies). Every code path that creates one must close it, including
+    # the exception paths — otherwise a failing hub slowly fills the client
+    # with dead instances and nothing in the bridge ever notices.
+    @property
+    def opened(self) -> int:
+        return sum(1 for m, p, _ in self.calls if (m, p) == ("POST", "/search"))
+
+    @property
+    def closed(self) -> int:
+        return sum(1 for m, p, _ in self.calls if m == "DELETE" and p.startswith("/search/"))
+
+    def assert_no_leak(self, test):
+        test.assertEqual(self.opened, self.closed,
+                         f"leaked {self.opened - self.closed} search instance(s): "
+                         f"{[(m, p) for m, p, _ in self.calls]}")
+
+
+class TestSearchInstanceLifetime(unittest.TestCase):
+    """Every created instance must be released on every path."""
+
+    RESULT = [{"id": "ABC", "path": "/m/Dune.2021.1080p/", "size": 9 * 1024**3,
+               "users": {"count": 3}, "slots": {"free": 4}}]
+
+    def _client(self, extra=None):
+        r = {("GET", "/search/1/results/0/200"): (200, list(self.RESULT)),
+             ("POST", "/search/1/results/ABC/download"):
+                 (200, {"bundle_info": {"id": 42}})}
+        r.update(extra or {})
+        return FakeClient(r)
+
+    def test_closed_on_successful_grab(self):
+        c = self._client()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_download_fails(self):
+        """The failure path is the one that leaked: download_result raises and
+        the close() on the next line never runs."""
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_ranking_raises(self):
+        c = self._client()
+        with unittest.mock.patch("core.rank", side_effect=RuntimeError("bad")):
+            with self.assertRaises(RuntimeError):
+                core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_no_results(self):
+        c = FakeClient({("GET", "/search/1/results/0/200"): (200, [])})
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_on_season_grab_failure(self):
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.grab_tv_season(c, "Severance", 2, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_hub_search_rejected(self):
+        """503 overflow: the instance was already created, so it must be
+        released before the error propagates."""
+        c = FakeClient({("POST", "/search/1/hub_search"): (503, {"message": "overflow"})})
+        with self.assertRaises(FulDCError):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
+
+    def test_closed_when_results_fetch_raises(self):
+        c = FakeClient()
+        c.responses[("GET", "/search/1/results/0/200")] = None   # triggers TypeError
+        with self.assertRaises(Exception):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
 
 
 class TestAutoSearchIncrementation(unittest.TestCase):
@@ -190,6 +281,143 @@ class TestRanker(unittest.TestCase):
                self._res("/tv/Severance.S02E01.1080p/", 2 * 1024**3)]
         cands = ranker.rank(res, "Severance", None, ranker.Prefs(), kind="series")
         self.assertIn("S02.COMPLETE", cands[0].release)
+
+
+class TestSecureEqual(unittest.TestCase):
+    """hmac.compare_digest raises TypeError on a non-ASCII str, and every secret
+    we compare arrives from the network — so the raw call would blow up before
+    the auth decision was ever made."""
+
+    def test_matches_and_rejects(self):
+        self.assertTrue(httputil.secure_equal("hunter2", "hunter2"))
+        self.assertFalse(httputil.secure_equal("hunter2", "hunter3"))
+
+    def test_non_ascii_is_a_mismatch_not_a_crash(self):
+        for hostile in ["tökén", "日本語", "\udcff", "café"]:
+            self.assertFalse(httputil.secure_equal(hostile, "secret"))
+            self.assertFalse(httputil.secure_equal("secret", hostile))
+        self.assertTrue(httputil.secure_equal("tökén", "tökén"))
+
+    def test_none_is_a_mismatch(self):
+        self.assertFalse(httputil.secure_equal(None, "secret"))
+        self.assertFalse(httputil.secure_equal("secret", None))
+        self.assertFalse(httputil.secure_equal(None, None))
+
+
+class FakeHandler:
+    """Just enough of BaseHTTPRequestHandler for the body helpers."""
+
+    def __init__(self, body: bytes, content_length=None):
+        self.headers = {"Content-Length":
+                        str(len(body)) if content_length is None else content_length}
+        self.rfile = io.BytesIO(body)
+
+
+class TestReadBody(unittest.TestCase):
+    def test_reads_exactly(self):
+        self.assertEqual(httputil.read_body(FakeHandler(b"hello")), b"hello")
+
+    def test_malformed_length_returns_empty(self):
+        for bad in ["abc", "", "1.5", "٣"]:
+            self.assertEqual(httputil.read_body(FakeHandler(b"data", bad)), b"")
+
+    def test_negative_length_does_not_block(self):
+        """read(-1) blocks until EOF, pinning a request thread."""
+        self.assertEqual(httputil.read_body(FakeHandler(b"data", "-1")), b"")
+
+    def test_caps_allocation(self):
+        h = FakeHandler(b"x" * 100, str(10 * 1024**3))   # claims 10 GB
+        self.assertLessEqual(len(httputil.read_body(h, max_bytes=64)), 64)
+
+    def test_body_too_large_detects_the_claim(self):
+        self.assertTrue(httputil.body_too_large(FakeHandler(b"", "999999999")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "10")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "junk")))
+
+
+class TestWebhookPayloadHandling(unittest.TestCase):
+    """The payload template is user-editable in Seerr, so `handle` must survive
+    anything. It runs on a detached thread after the 200 was already sent."""
+
+    def _capture(self, payload):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            webhook_server.handle(payload)
+        return buf.getvalue()
+
+    def test_survives_null_media(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": None, "subject": "Dune (2021)"})
+        self.assertIn("[skip]", out)
+
+    def test_survives_wrong_types(self):
+        for payload in [{"notification_type": 5, "media": "nope", "subject": 12},
+                        {"media": {"media_type": None}},
+                        {"notification_type": "MEDIA_APPROVED", "media": []}]:
+            self.assertNotIn("Traceback", self._capture(payload))
+
+    def test_unknown_media_type_is_never_treated_as_a_movie(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": {"media_type": "anime"},
+                             "subject": "Frieren (2023)"})
+        self.assertIn("unsupported media_type", out)
+
+    def test_errors_are_logged_with_a_traceback(self):
+        with unittest.mock.patch("webhook_server.parse", side_effect=RuntimeError("x")):
+            out = self._capture({"subject": "Dune"})
+        self.assertIn("Traceback", out)
+        self.assertIn("Dune", out)
+
+
+class TestRequestedSeasons(unittest.TestCase):
+    def _p(self, value):
+        return {"extra": [{"name": "Requested Seasons", "value": value}]}
+
+    def test_parses_a_list(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("1, 2")), [1, 2])
+
+    def test_specials_are_kept(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("0")), [0])
+
+    def test_implausible_numbers_are_dropped(self):
+        """A stray year would otherwise create a permanent S2024E%[inc] monitor."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(webhook_server.requested_seasons(self._p("2024, 3")), [3])
+
+    def test_tolerates_junk(self):
+        for payload in [{}, {"extra": None}, {"extra": ["nope"]},
+                        self._p("All Seasons"), self._p(None)]:
+            self.assertIsInstance(webhook_server.requested_seasons(payload), list)
+
+
+class TestSeasonZero(unittest.TestCase):
+    """Season 0 is Specials. Truthiness checks silently drop it."""
+
+    def test_target_includes_s00(self):
+        got = core.resolve_target("series", "Show", None, r"S:\dc", None, 0)
+        self.assertTrue(got.endswith("S00\\"), got)
+
+    def test_matcher_includes_s00(self):
+        self.assertEqual(core.autosearch_matcher("Show", None, "series", 0), "Show S00")
+
+
+class TestStoreEviction(unittest.TestCase):
+    def setUp(self):
+        store._store.clear()
+
+    def test_get_promotes_so_active_entries_survive(self):
+        store.put("keep", {"release": "A"})
+        for i in range(store._MAX):
+            if i == store._MAX // 2:
+                store.get("keep")          # touched halfway through
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertIsNotNone(store.get("keep"),
+                             "an entry read recently was evicted anyway")
+
+    def test_cap_is_enforced(self):
+        for i in range(store._MAX + 50):
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertLessEqual(len(store._store), store._MAX)
 
 
 if __name__ == "__main__":
