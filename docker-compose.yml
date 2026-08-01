@@ -22,8 +22,39 @@ services:
       SERIES_DIR: "${SERIES_DIR:-}"
       # "1" = only handle movie requests, "0" = movies + TV
       MOVIES_ONLY: "${MOVIES_ONLY:-0}"
+      # Optional quality filter, e.g. 1080p. Movies: only that quality is grabbed.
+      # TV: baked into the %[inc] episode monitor. Blank = any quality.
+      QUALITY: "${QUALITY:-}"
       PORT: "8080"
     # host.docker.internal is built in on Docker Desktop (Windows/macOS).
     # On Linux this line makes it resolve to the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------------------------------------
+  # EXPERIMENTAL: full Radarr/Sonarr integration (Torznab indexer + qBittorrent
+  # shim). Not needed for the Seerr flow above. Enable with:
+  #     docker compose --profile arr up -d
+  # Then in Radarr/Sonarr add a Generic Torznab indexer (URL
+  # http://<host>:9117/torznab, API key = TORZNAB_APIKEY) and a qBittorrent
+  # download client (host <host>, port 9117).
+  # ---------------------------------------------------------------------------
+  fuldc-arr:
+    image: ghcr.io/pete1979/fuldc-arr-bridge:latest
+    container_name: fuldc-arr
+    profiles: ["arr"]
+    command: ["python", "arr_server.py"]
+    restart: unless-stopped
+    ports:
+      - "9117:9117"
+    environment:
+      FULDC_URL: "${FULDC_URL:-http://host.docker.internal:5600}"
+      FULDC_USER: "${FULDC_USER:-admin}"
+      FULDC_PASS: "${FULDC_PASS:?set FULDC_PASS in .env}"
+      DC_ROOT: "${DC_ROOT:?set DC_ROOT in .env}"
+      MOVIES_DIR: "${MOVIES_DIR:-}"
+      SERIES_DIR: "${SERIES_DIR:-}"
+      TORZNAB_APIKEY: "${TORZNAB_APIKEY:-changeme}"
+      ARR_PORT: "9117"
     extra_hosts:
       - "host.docker.internal:host-gateway"

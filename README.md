@@ -88,6 +88,7 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `DC_ROOT` | *(required)* | **your** DC share root on the FulDC++ host, a Windows path (e.g. `S:\dc`, `D:\Media`). `movies→DC_ROOT\movies\`, `series→DC_ROOT\series\<Show>\S<NN>\` |
 | `MOVIES_DIR` / `SERIES_DIR` | *(from DC_ROOT)* | optional full-path overrides for non-standard layouts |
 | `MOVIES_ONLY` | `0` | `1` = only movies, `0` = movies + TV |
+| `QUALITY` | *(any)* | e.g. `1080p` — movies: only that quality is grabbed; TV: baked into the `%[inc]` episode monitor |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
 | `PORT` | `8080` | webhook listen port |
 
@@ -117,6 +118,24 @@ docker compose run --rm fuldc-arr-bridge python bridge.py grab "Severance" --kin
 ```
 
 `search` is read-only; `grab` is a dry run unless you add `--grab`.
+
+## Experimental: full Radarr/Sonarr integration
+
+> ⚠️ **Beta.** The Seerr flow above already covers most needs (and for re-share
+> setups it's usually the better fit). This adds a **Torznab indexer** + a
+> **qBittorrent-compatible download client** so Radarr/Sonarr can use FulDC++
+> directly. The API integration works; the *import* side (remote-path mapping +
+> how Radarr treats RAR content) still needs real-world tuning.
+
+Enable it:
+```bash
+docker compose --profile arr up -d      # starts fuldc-arr on :9117
+```
+Then in Radarr/Sonarr:
+- **Indexer** → Generic Torznab, URL `http://<host>:9117/torznab`, API key = `TORZNAB_APIKEY`.
+- **Download client** → qBittorrent, host `<host>`, port `9117`.
+
+Feedback welcome — see [DESIGN.md](DESIGN.md) for the architecture.
 
 ## Advanced: Kubernetes
 
