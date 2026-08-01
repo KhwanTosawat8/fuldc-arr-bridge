@@ -11,10 +11,18 @@ working-looking AutoSearch item that silently never matches anything.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import unittest
+import unittest.mock
+
+os.environ.setdefault("FULDC_PASS", "test")
 
 import core
+import httputil
 import ranker
+import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
 
 
@@ -329,6 +337,116 @@ class TestAutoSearchSizeFloor(unittest.TestCase):
         body = c.body_for("POST", "/auto_search/items")
         self.assertEqual(body.get("min_size"), ranker.Prefs().min_size_episode)
         self.assertLess(body["min_size"], ranker.Prefs().min_size)
+
+
+class TestSecureEqual(unittest.TestCase):
+    """hmac.compare_digest raises TypeError on a non-ASCII str, and every
+    secret we compare arrives from the network — so the raw call blew up
+    before the auth decision was ever reached, resetting the connection
+    instead of returning 401."""
+
+    def test_matches_and_rejects(self):
+        self.assertTrue(httputil.secure_equal("hunter2", "hunter2"))
+        self.assertFalse(httputil.secure_equal("hunter2", "hunter3"))
+
+    def test_non_ascii_is_a_mismatch_not_a_crash(self):
+        for hostile in ["tökén", "日本語", "\udcff", "café", "Ω"]:
+            self.assertFalse(httputil.secure_equal(hostile, "secret"))
+            self.assertFalse(httputil.secure_equal("secret", hostile))
+        self.assertTrue(httputil.secure_equal("tökén", "tökén"))
+
+    def test_none_is_a_mismatch(self):
+        self.assertFalse(httputil.secure_equal(None, "secret"))
+        self.assertFalse(httputil.secure_equal("secret", None))
+        self.assertFalse(httputil.secure_equal(None, None))
+
+
+class FakeHandler:
+    """Just enough of BaseHTTPRequestHandler for the body helpers."""
+
+    def __init__(self, body: bytes, content_length=None):
+        self.headers = {"Content-Length":
+                        str(len(body)) if content_length is None else content_length}
+        self.rfile = io.BytesIO(body)
+
+
+class TestReadBody(unittest.TestCase):
+    def test_reads_exactly(self):
+        self.assertEqual(httputil.read_body(FakeHandler(b"hello")), b"hello")
+
+    def test_malformed_length_returns_empty(self):
+        # int("٣") is 3 in Python, but that is not a valid Content-Length
+        for bad in ["abc", "", "1.5", "٣", "0x10"]:
+            self.assertEqual(httputil.read_body(FakeHandler(b"data", bad)), b"")
+
+    def test_negative_length_does_not_block(self):
+        """read(-1) blocks until EOF, pinning a request thread."""
+        self.assertEqual(httputil.read_body(FakeHandler(b"data", "-1")), b"")
+
+    def test_caps_allocation(self):
+        h = FakeHandler(b"x" * 100, str(10 * 1024**3))   # claims 10 GB
+        self.assertLessEqual(len(httputil.read_body(h, max_bytes=64)), 64)
+
+    def test_body_too_large_detects_the_claim(self):
+        self.assertTrue(httputil.body_too_large(FakeHandler(b"", "999999999")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "10")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "junk")))
+
+
+class TestWebhookPayloadHandling(unittest.TestCase):
+    """handle() runs on a detached thread after the 200 was already sent, and
+    the payload template is user-editable in Seerr, so anything can arrive."""
+
+    def _capture(self, payload):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            webhook_server.handle(payload)
+        return buf.getvalue()
+
+    def test_survives_null_media(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": None, "subject": "Dune (2021)"})
+        self.assertIn("[skip]", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_survives_wrong_types(self):
+        for payload in [{"notification_type": 5, "media": "nope", "subject": 12},
+                        {"media": {"media_type": None}},
+                        {"notification_type": "MEDIA_APPROVED", "media": []}]:
+            self.assertNotIn("Traceback", self._capture(payload))
+
+    def test_unknown_media_type_is_never_treated_as_a_movie(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": {"media_type": "anime"},
+                             "subject": "Frieren (2023)"})
+        self.assertIn("unsupported media_type", out)
+
+    def test_errors_are_logged_with_a_traceback(self):
+        with unittest.mock.patch("webhook_server.parse", side_effect=RuntimeError("x")):
+            out = self._capture({"subject": "Dune"})
+        self.assertIn("Traceback", out)
+        self.assertIn("Dune", out)
+
+
+class TestRequestedSeasons(unittest.TestCase):
+    def _p(self, value):
+        return {"extra": [{"name": "Requested Seasons", "value": value}]}
+
+    def test_parses_a_list(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("1, 2")), [1, 2])
+
+    def test_specials_are_kept(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("0")), [0])
+
+    def test_implausible_numbers_are_dropped(self):
+        """A stray year would otherwise create a permanent S2024 monitor."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(webhook_server.requested_seasons(self._p("2024, 3")), [3])
+
+    def test_tolerates_junk(self):
+        for payload in [{}, {"extra": None}, {"extra": ["nope"]},
+                        self._p("All Seasons"), self._p(None)]:
+            self.assertIsInstance(webhook_server.requested_seasons(payload), list)
 
 
 if __name__ == "__main__":
