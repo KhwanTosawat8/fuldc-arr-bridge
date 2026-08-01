@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 
 from fuldc_client import FulDCClient
@@ -23,8 +24,15 @@ import store
 _BTIH = re.compile(r"btih:([0-9a-fA-F]{40})", re.IGNORECASE)
 _PCT = re.compile(r"([\d.]+)%")
 
-# hash -> tracked "torrent"
+# hash -> tracked "torrent". Mutated from ThreadingHTTPServer request threads
+# (Radarr adds and polls concurrently), so every access takes the lock.
 _torrents: dict[str, dict] = {}
+_lock = threading.Lock()
+
+
+def _track(h: str, entry: dict) -> None:
+    with _lock:
+        _torrents[h] = entry
 
 
 def version() -> str:
@@ -96,6 +104,12 @@ def add(client: FulDCClient, urls: list[str], category: str) -> None:
         h = _btih(u)
         if not h:
             continue
+        with _lock:
+            if h in _torrents:
+                # Radarr retries an add it thinks failed; without this both
+                # threads re-acquire and queue two bundles for one release.
+                print(f"[qbit] add: {h[:12]} already tracked — ignoring", flush=True)
+                continue
         info = store.get(h)
         if not info:
             # store is in-memory, so a restart loses the mapping. Surface it as
@@ -103,22 +117,22 @@ def add(client: FulDCClient, urls: list[str], category: str) -> None:
             # waits forever on something that will never appear.
             print(f"[qbit] add: unknown magnet {h[:12]} (no stored search) — "
                   f"reporting as failed", flush=True)
-            _torrents[h] = {"name": h[:12], "category": category or "", "size": 0,
-                            "save_path": "", "added_on": int(time.time()),
-                            "bundle_id": None, "failed": True}
+            _track(h, {"name": h[:12], "category": category or "", "size": 0,
+                       "save_path": "", "added_on": int(time.time()),
+                       "bundle_id": None, "failed": True})
             continue
         res = _reacquire(client, info)
         if not res:
             print(f"[qbit] add: {info['release']!r} not found on hubs right now", flush=True)
-            _torrents[h] = {"name": info["release"], "category": category or "",
-                            "size": info["size"], "save_path": "",
-                            "added_on": int(time.time()), "bundle_id": None,
-                            "failed": True}
+            _track(h, {"name": info["release"], "category": category or "",
+                       "size": info["size"], "save_path": "",
+                       "added_on": int(time.time()), "bundle_id": None,
+                       "failed": True})
             continue
         bundle_id, target = res
-        _torrents[h] = {"name": info["release"], "category": category or "",
-                        "size": info["size"], "save_path": target,
-                        "added_on": int(time.time()), "bundle_id": bundle_id}
+        _track(h, {"name": info["release"], "category": category or "",
+                   "size": info["size"], "save_path": target,
+                   "added_on": int(time.time()), "bundle_id": bundle_id})
         print(f"[qbit] add: {info['release']!r} -> bundle {bundle_id} @ {target}", flush=True)
 
 
@@ -136,15 +150,43 @@ def _state(bundle: dict | None):
     return "downloading", (float(m.group(1)) / 100 if m else 0.0)
 
 
+def _bundle_for(client: FulDCClient, t: dict, by_id: dict | None) -> dict | None:
+    """Bundle for one tracked torrent, tolerating a partial failure.
+
+    A single unreachable bundle must not fail the whole /torrents/info
+    response: Radarr reads an empty list as "every download disappeared" and
+    clears its queue."""
+    bid = t.get("bundle_id")
+    if bid is None:
+        return None
+    if by_id is not None:
+        return by_id.get(bid)
+    try:
+        return client.get_bundle(bid)
+    except Exception as e:  # noqa: BLE001
+        print(f"[qbit] bundle {bid} unavailable: {e}", flush=True)
+        return None
+
+
 def info(client: FulDCClient, category: str | None = None) -> list[dict]:
     out = []
-    for h, t in list(_torrents.items()):
+    # One call for the whole queue rather than one per tracked torrent: Radarr
+    # polls this every minute, and the old shape made N serial round trips
+    # inside the request thread, each with a 25s client timeout.
+    try:
+        by_id = {b.get("id"): b for b in client.list_bundles() if isinstance(b, dict)}
+    except Exception as e:  # noqa: BLE001 - fall back to per-item lookups
+        print(f"[qbit] bundle list unavailable ({e}); falling back", flush=True)
+        by_id = None
+    with _lock:
+        tracked = list(_torrents.items())
+    for h, t in tracked:
         if category and t["category"] != category:
             continue
         if t.get("failed"):
             state, progress, bundle = "error", 0.0, None
         else:
-            bundle = client.get_bundle(t["bundle_id"]) if t.get("bundle_id") else None
+            bundle = _bundle_for(client, t, by_id)
             state, progress = _state(bundle)
         content_path = (bundle or {}).get("target") or t["save_path"]
         out.append({
@@ -162,6 +204,9 @@ def info(client: FulDCClient, category: str | None = None) -> list[dict]:
 
 def delete(client: FulDCClient, hashes: list[str], delete_files: bool = False) -> None:
     for h in hashes:
-        t = _torrents.pop(h, None)
+        with _lock:
+            t = _torrents.pop(h, None)
         if t and delete_files and t.get("bundle_id"):
-            client.remove_bundle(t["bundle_id"])
+            if not client.remove_bundle(t["bundle_id"]):
+                print(f"[qbit] delete: bundle {t['bundle_id']} could not be removed; "
+                      f"it is now orphaned in the FulDC++ queue", flush=True)

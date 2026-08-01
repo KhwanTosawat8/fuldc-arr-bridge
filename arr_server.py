@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -132,16 +133,21 @@ class Handler(BaseHTTPRequestHandler):
             urls = [u for u in re.split(r"[\r\n]+", f.get("urls", "")) if u.strip()]
             try:
                 qbit.add(client(), urls, f.get("category", ""))
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] add error: {e}", flush=True)
+            except Exception:  # noqa: BLE001
+                # "Ok." makes Radarr record a successful grab for a download
+                # that will never exist: nothing in the queue, no retry, no
+                # blocklist. "Fails." is what lets it try the next release.
+                print(f"[qbit] add error:\n{traceback.format_exc()}", flush=True)
+                return self._send(200, b"Fails.", "text/plain")
             return self._send(200, b"Ok.", "text/plain")
         if path == "/api/v2/torrents/delete":
             f = self._form()
             hashes = [h for h in f.get("hashes", "").split("|") if h]
             try:
-                qbit.delete(client(), hashes, f.get("deleteFiles", "false") == "true")
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] delete error: {e}", flush=True)
+                qbit.delete(client(), hashes,
+                            f.get("deleteFiles", "false").lower() == "true")
+            except Exception:  # noqa: BLE001
+                print("[qbit] delete error:\n" + traceback.format_exc(), flush=True)
             return self._send(200, b"Ok.", "text/plain")
         # createCategory / setCategory / setForceStart / etc. — accept silently
         self._read_body()
@@ -161,9 +167,12 @@ class Handler(BaseHTTPRequestHandler):
             cat = params.get("category", [None])[0]
             try:
                 return self._json(qbit.info(client(), cat))
-            except Exception as e:  # noqa: BLE001
-                print(f"[qbit] info error: {e}", flush=True)
-                return self._json([])
+            except Exception:  # noqa: BLE001
+                # An empty list reads to Radarr as "every download vanished",
+                # which clears its queue on one transient blip. A 502 reads as
+                # "client unreachable" — true, and recoverable.
+                print(f"[qbit] info error:\n{traceback.format_exc()}", flush=True)
+                return self._send(502, b"[]", "application/json")
         self._json({})
 
     def _torznab(self, params: dict):
