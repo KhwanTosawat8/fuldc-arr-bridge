@@ -16,12 +16,12 @@ import io
 import os
 import unittest
 import unittest.mock
-
 os.environ.setdefault("FULDC_PASS", "test")
 
 import core
 import httputil
 import ranker
+import torznab
 import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
 
@@ -49,6 +49,25 @@ class FakeClient(FulDCClient):
             if m == method and p == path:
                 return b or {}
         raise AssertionError(f"no {method} {path} in {[(m, p) for m, p, _ in self.calls]}")
+
+    # --- search-instance leak accounting ---------------------------------
+    # A FulDC++ search instance lives server-side until DELETEd (or until the
+    # session ends). Every path that creates one must release it, including the
+    # exception paths — otherwise a flaky hub slowly fills the client with dead
+    # instances and nothing in the bridge notices.
+    @property
+    def opened(self) -> int:
+        return sum(1 for m, p, _ in self.calls if (m, p) == ("POST", "/search"))
+
+    @property
+    def closed(self) -> int:
+        return sum(1 for m, p, _ in self.calls
+                   if m == "DELETE" and p.startswith("/search/"))
+
+    def assert_no_leak(self, test):
+        test.assertEqual(self.opened, self.closed,
+                         f"leaked {self.opened - self.closed} search instance(s): "
+                         f"{[(m, p) for m, p, _ in self.calls]}")
 
 
 class TestAutoSearchIncrementation(unittest.TestCase):
@@ -269,6 +288,77 @@ class TestDirectoryDownloadResolution(unittest.TestCase):
         })
         out = c.download_result(1, "r1", "S:\\dc\\series\\X\\S01\\", name="X.S01")
         self.assertEqual(out["bundle_id"], 999)
+
+
+class TestSearchInstanceLifetime(unittest.TestCase):
+    """Every created search instance must be released on every path."""
+
+    RESULT = [{"id": "ABC", "path": "/m/Dune.2021.1080p/", "size": 9 * 1024**3,
+               "users": {"count": 3}, "slots": {"free": 4}}]
+
+    def _client(self, extra=None):
+        r = {("GET", "/search/1/results/0/200"): (200, list(self.RESULT)),
+             ("POST", "/search/1/results/ABC/download"):
+                 (200, {"bundle_info": {"id": 42}})}
+        r.update(extra or {})
+        return FakeClient(r)
+
+    def test_closed_on_successful_grab(self):
+        c = self._client()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_download_fails(self):
+        """This is the path that leaked: download_result raises, so the
+        close() on the following line never runs."""
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_ranking_raises(self):
+        c = self._client()
+        with unittest.mock.patch("core.rank", side_effect=RuntimeError("bad")):
+            with self.assertRaises(RuntimeError):
+                core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_no_results(self):
+        c = FakeClient({("GET", "/search/1/results/0/200"): (200, [])})
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_on_season_grab_failure(self):
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.grab_tv_season(c, "Severance", 2, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_hub_search_rejected(self):
+        """503 overflow: the instance already exists, so it must be released
+        before the error propagates."""
+        c = FakeClient({("POST", "/search/1/hub_search"): (503, {"message": "overflow"})})
+        with self.assertRaises(FulDCError):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
+
+    def test_closed_when_results_fetch_raises(self):
+        c = FakeClient()
+        c.responses[("GET", "/search/1/results/0/200")] = None   # -> TypeError
+        with self.assertRaises(Exception):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
+
+    def test_closed_when_indexer_ranking_raises(self):
+        c = self._client()
+        with unittest.mock.patch("torznab.rank", side_effect=RuntimeError("bad")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                torznab.search_items(c, query="Dune", kind="movie", season=None,
+                                     limit=10, prefs=ranker.Prefs(), wait=0)
+        c.assert_no_leak(self)
 
 
 class TestSecureEqual(unittest.TestCase):
