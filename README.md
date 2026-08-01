@@ -106,6 +106,11 @@ Optional media-server refresh (most servers scan periodically anyway):
 - **Movies** → best-ranked release into `DC_ROOT\movies\`.
 - **TV** → per requested season into `DC_ROOT\series\<Show>\S<NN>\`, preferring
   full **season packs** over single episodes.
+  - **Ongoing show** (status *Returning*) → creates a `%[inc]` per-episode
+    AutoSearch that keeps grabbing new episodes as they air (Sonarr-style).
+  - **Ended/canceled show** → grabs each season as a pack instead (a `%[inc]`
+    monitor would never match, since past seasons ship as packs). Needs a
+    metadata source (`TMDB_API_KEY` or `SEERR_URL`+`SEERR_API_KEY`).
 - **Available now** → downloads immediately. **Not shared yet** → creates an
   AutoSearch item so FulDC++ grabs it when it appears.
 - Ranking uses title/year/quality/language and skips CAM/TS/sample and content

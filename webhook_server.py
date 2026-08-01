@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from fuldc_client import FulDCClient
 from ranker import Prefs
 from core import hybrid_grab, monitor_tv_season
-from metadata import is_kids
+from metadata import classify
 
 APPROVED = {"MEDIA_APPROVED", "MEDIA_AUTO_APPROVED"}
 YEAR_RE = re.compile(r"\((\d{4})\)")
@@ -114,14 +114,22 @@ def handle(payload: dict) -> None:
     if not title:
         print("[skip] empty title", flush=True)
         return
-    kids = (os.environ.get("KIDS_ROUTING", "1") == "1"
-            and is_kids(tmdb, mtype, log=lambda m: print(m, flush=True)))
+    kids, ended = classify(tmdb, mtype, log=lambda m: print(m, flush=True))
+    if os.environ.get("KIDS_ROUTING", "1") != "1":
+        kids = False
     mov_dir, ser_dir = _request_dirs(kids)
     if kids:
         print(f"[kids] routing {title!r} -> kids folders", flush=True)
     if mtype == "tv":
         seasons = requested_seasons(payload)
-        if seasons:
+        if ended:
+            # Ended/canceled show: episodes are already out (usually as season
+            # packs). Grab each requested season as a pack instead of a %[inc]
+            # per-episode monitor that would never find anything.
+            print(f"[ended] {title!r} -> season-pack grab (no %[inc] monitor)", flush=True)
+            for season in (seasons or [None]):
+                _grab(title, year, kind="series", season=season, series_dir=ser_dir)
+        elif seasons:
             for season in seasons:
                 _monitor_tv(title, season, series_dir=ser_dir)   # %[inc] monitor
         else:
