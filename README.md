@@ -124,6 +124,17 @@ docker compose run --rm fuldc-arr-bridge python bridge.py grab "Severance" --kin
 
 `search` is read-only; `grab` is a dry run unless you add `--grab`.
 
+## Development
+
+```bash
+python -m unittest -v test_bridge     # stdlib only, no network, ~1ms
+```
+
+The tests fake the FulDC++ API at the transport boundary and assert the exact
+request bodies. Several of them guard behaviour the API requires but doesn't
+enforce — a missing `use_params`, for example, produces an AutoSearch item that
+looks fine in the UI and silently never matches anything.
+
 ## Experimental: full Radarr/Sonarr integration
 
 > ⚠️ **Beta.** The Seerr flow above already covers most needs (and for re-share

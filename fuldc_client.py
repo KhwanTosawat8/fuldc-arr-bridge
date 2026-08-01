@@ -16,7 +16,19 @@ from typing import Any
 
 
 class FulDCError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+# Priority enum values, per airdcpp/core/types/Priority.h:23-33. The API
+# defaults an absent priority to LOW (FileSearchParser.cpp:34-37), which is both
+# the slowest per-hub interval (15s vs 5s) and the first class rejected by the
+# search-queue overflow guard (SearchEntity.cpp:184 sheds priority <= NORMAL).
+# Always send one explicitly.
+PRIO_LOW = 3        # background/RSS-shaped polling: shed me first, that's correct
+PRIO_NORMAL = 4
+PRIO_HIGH = 5       # someone is waiting on this: interactive grabs
 
 
 class FulDCClient:
@@ -62,20 +74,27 @@ class FulDCClient:
 
     # --- search ----------------------------------------------------------
     def search(self, pattern: str, wait: float = 10.0, poll: float = 1.0,
-               plateau: float = 3.0) -> tuple[int, list[dict]]:
+               plateau: float = 3.0, priority: int = PRIO_HIGH) -> tuple[int, list[dict]]:
         """Run a hub search, wait for results to settle, return (instance_id, results).
 
         Waits up to `wait` seconds, stopping early once result_count has been
         unchanged for `plateau` seconds. Caller is responsible for close().
+
+        `priority` is a top-level field of the hub_search body (sibling of
+        `query`), not part of the matcher. Omitting it means LOW — see the
+        PRIO_* constants above for why that is the wrong default for us.
         """
         st, inst = self._call("POST", "/search")
         if st != 200:
-            raise FulDCError(f"create search instance http {st}: {inst}")
+            raise FulDCError(f"create search instance http {st}: {inst}", st)
         iid = inst["id"]
-        st, _ = self._call("POST", f"/search/{iid}/hub_search", {"query": {"pattern": pattern}})
+        st, data = self._call("POST", f"/search/{iid}/hub_search",
+                              {"priority": priority, "query": {"pattern": pattern}})
         if st != 200:
             self.close(iid)
-            raise FulDCError(f"hub_search http {st}")
+            # 503 = "Search queue overflow": the client's outgoing search queue
+            # is backed up past 20 minutes. Caller decides whether to back off.
+            raise FulDCError(f"hub_search http {st}: {data}", st)
         deadline = time.time() + wait
         last_count, stable_since = -1, time.time()
         while time.time() < deadline:
@@ -156,16 +175,41 @@ class FulDCClient:
 
     def create_autosearch(self, search_string: str, target_directory: str | None = None,
                           excluded: str = "", file_type: str = "", min_size: int = 0,
-                          remove_after_hit: bool = True, action: str = "download") -> dict:
-        """Create a persistent AutoSearch item — the client keeps searching and
-        auto-downloads (to target_directory) when the release appears. Ideal for
-        content nobody is sharing right this moment."""
+                          remove_after_hit: bool = True, action: str = "download",
+                          use_params: bool = False, cur_number: int = 1,
+                          max_number: int = 0, number_length: int = 2,
+                          expire_days: int = 0) -> dict:
+        """Create (or update, if it already exists) a persistent AutoSearch item.
+
+        The client keeps searching and auto-downloads to target_directory when
+        the release appears — for content nobody is sharing right this moment.
+
+        `use_params` is REQUIRED for %[inc] episode monitors. AutoSearch.cpp:207
+        returns early from formatParams when useParams is false, and
+        usingIncrementation() (:264) gates on it too — so without this flag a
+        search string of "Show S01E%[inc]" is sent to hubs verbatim and matches
+        nothing, forever.
+
+        The API 409s on a duplicate search_string (AutoSearchApi.cpp:322-325),
+        so re-requesting the same title must update the existing item rather
+        than fail.
+        """
         body: dict = {
             "search_string": search_string,
             "action": action,
             "matcher_type": "partial",
             "remove_after_hit": remove_after_hit,
+            # let the client skip what we already have instead of re-grabbing it
+            "check_already_queued": True,
+            "check_already_shared": True,
         }
+        if use_params:
+            # %[inc] expansion: start at cur_number, zero-pad to number_length,
+            # 0 = no upper bound (AutoSearch.cpp:161-175, 190-204)
+            body.update({"use_params": True, "cur_number": cur_number,
+                         "max_number": max_number, "number_length": number_length})
+        if expire_days:
+            body["expire_time"] = int(time.time()) + expire_days * 86400
         if excluded:
             body["excluded_string"] = excluded
         if file_type:
@@ -178,9 +222,27 @@ class FulDCClient:
                 td += "\\"
             body["target"] = td
         st, data = self._call("POST", "/auto_search/items", body)
+        if st == 409:
+            existing = self.find_autosearch(search_string)
+            if existing:
+                return self.update_autosearch(existing["id"], body) or existing
         if st not in (200, 201):
-            raise FulDCError(f"create autosearch http {st}: {data}")
+            raise FulDCError(f"create autosearch http {st}: {data}", st)
         return data or {}
+
+    def find_autosearch(self, search_string: str) -> dict | None:
+        for item in self.list_autosearch():
+            if item.get("search_string") == search_string:
+                return item
+        return None
+
+    def update_autosearch(self, item_id: int, body: dict) -> dict | None:
+        """PATCH an existing item. Re-enables it and refreshes target/expiry —
+        a repeat request for the same title should revive a spent item."""
+        patch = {k: v for k, v in body.items() if k != "search_string"}
+        patch["enabled"] = True
+        st, data = self._call("PATCH", f"/auto_search/items/{item_id}", patch)
+        return data if st in (200, 201) else None
 
     def delete_autosearch(self, item_id: int) -> bool:
         st, _ = self._call("DELETE", f"/auto_search/items/{item_id}")
