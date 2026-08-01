@@ -148,7 +148,7 @@ class TestTargetPathSafety(unittest.TestCase):
 
     def test_normal_names_survive(self):
         got = core.resolve_target("series", "The Expanse", None, r"S:\dc", None, 3)
-        self.assertEqual(got, "S:\\dc\\series\\The Expanse\\S03\\")
+        self.assertEqual(got, "S:\\dc\\series\\The.Expanse\\S03\\")
 
 
 class TestRanker(unittest.TestCase):
@@ -221,7 +221,13 @@ class TestYearFolder(unittest.TestCase):
     def test_series_folder_gets_year(self):
         got = core.resolve_target("series", "Shameless", None, r"S:\dc", None, 3,
                                   year=2011)
-        self.assertEqual(got, "S:\\dc\\series\\Shameless (2011)\\S03\\")
+        self.assertEqual(got, "S:\\dc\\series\\Shameless.2011\\S03\\")
+
+    def test_dotted_scene_folder(self):
+        got = core.resolve_target("series", "Star Trek: Strange New Worlds", None,
+                                  r"S:\dc", None, 4, year=2022)
+        self.assertEqual(
+            got, "S:\\dc\\series\\Star.Trek.Strange.New.Worlds.2022\\S04\\")
 
     def test_no_year_is_unchanged(self):
         got = core.resolve_target("series", "Silo", None, r"S:\dc", None, 2)

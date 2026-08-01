@@ -54,10 +54,10 @@ def resolve_target(kind: str, title: str, series: str | None,
     root = dc_root.rstrip("\\/")
     if kind == "series":
         base = (series_dir or f"{root}\\series").rstrip("\\/")
-        show = safe_component(series or title)
+        # DC/scene convention: dotted show folder, year appended (Show.Name.2025)
+        show = scene_title(safe_component(series or title))
         if year:
-            # disambiguate for the media server (e.g. Shameless US vs UK)
-            show = f"{show} ({year})"
+            show = f"{show}.{year}"
         p = f"{base}\\{show}\\"
         return p + f"S{season:02d}\\" if season else p
     md = (movies_dir or f"{root}\\movies").rstrip("\\/")
