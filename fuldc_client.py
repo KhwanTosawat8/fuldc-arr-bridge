@@ -135,10 +135,12 @@ class FulDCClient:
         bi = data.get("bundle_info") or {}
         if bi.get("id"):
             return {"bundle_id": bi["id"], "merged": bi.get("merged")}
-        # Directory result: the API hands back the ids of the directory downloads
-        # it started. Poll *those* — scanning the global list would happily pick
-        # up a concurrent grab's bundle instead of ours.
-        dd_ids = data.get("directory_download_ids") or []
+        # Directory result: the API hands back the directory downloads it
+        # started. Poll *those* — scanning the global list would happily pick
+        # up a concurrent grab's bundle instead of ours. Some builds return bare
+        # ids, others full objects; normalise to ids.
+        dd_raw = data.get("directory_download_ids") or []
+        dd_ids = [d.get("id") if isinstance(d, dict) else d for d in dd_raw]
         for _ in range(15):
             for dd_id in dd_ids:
                 qb = (self.get_directory_download(dd_id).get("queue_info") or {}).get("bundle") or {}

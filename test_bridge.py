@@ -248,5 +248,20 @@ class TestSeasonPackMatcher(unittest.TestCase):
                          "must not match the wrong quality")
 
 
+class TestDirectoryDownloadResolution(unittest.TestCase):
+    """Some FulDC++ builds return `directory_download_ids` as full objects, not
+    bare ids — resolution must handle both or the download tracking crashes."""
+
+    def test_object_form_dd_ids(self):
+        c = FakeClient({
+            ("POST", "/search/1/results/r1/download"):
+                (200, {"directory_download_ids": [{"id": 50, "queue_info": None}]}),
+            ("GET", "/filelists/directory_downloads/50"):
+                (200, {"queue_info": {"bundle": {"id": 999, "merged": True}}}),
+        })
+        out = c.download_result(1, "r1", "S:\\dc\\series\\X\\S01\\", name="X.S01")
+        self.assertEqual(out["bundle_id"], 999)
+
+
 if __name__ == "__main__":
     unittest.main()
