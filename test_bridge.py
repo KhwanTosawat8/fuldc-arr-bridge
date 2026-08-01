@@ -14,11 +14,15 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import unicodedata
 import unittest
 import unittest.mock
+import xml.etree.ElementTree as ET
+
 os.environ.setdefault("FULDC_PASS", "test")
 
 import core
+import fuldc_client
 import httputil
 import ranker
 import torznab
@@ -469,6 +473,99 @@ class TestRequestedSeasons(unittest.TestCase):
         for payload in [{}, {"extra": None}, {"extra": ["nope"]},
                         self._p("All Seasons"), self._p(None)]:
             self.assertIsInstance(webhook_server.requested_seasons(payload), list)
+class TestUnicodeDecoding(unittest.TestCase):
+    """FulDC++ is a Windows app serving filenames that came off the hubs, so a
+    cp1252 byte is normal traffic. A bare .decode() raised UnicodeDecodeError,
+    which is not FulDCError and so escaped every caller and killed the request
+    thread."""
+
+    def test_cp1252_body_does_not_raise(self):
+        raw = "Kärlek och Anarki".encode("cp1252")
+        self.assertIsInstance(fuldc_client._decode(raw), str)
+
+    def test_utf8_still_decodes_exactly(self):
+        self.assertEqual(fuldc_client._decode("Kärlek".encode("utf-8")), "Kärlek")
+
+    def test_lone_surrogate_bytes_do_not_raise(self):
+        self.assertIsInstance(fuldc_client._decode(b"\xed\xa0\x80abc"), str)
+
+
+class TestSwedishTitles(unittest.TestCase):
+    """Swedish content is the stated primary use case and had no coverage."""
+
+    def _res(self, path, size=9 * 1024**3, users=3):
+        return {"path": path, "size": size, "users": {"count": users},
+                "slots": {"free": 4}, "type": {"id": "directory"}}
+
+    def test_accented_title_matches_transliterated_release(self):
+        """'Kärlek' and 'Karlek' are the same film; without folding the title
+        tokens score zero and an unrelated result wins."""
+        res = [self._res("/m/Karlek.Och.Anarki.2020.1080p.WEB/"),
+               self._res("/m/Something.Else.2020.1080p.WEB/")]
+        best = ranker.rank(res, "Kärlek och Anarki", 2020, ranker.Prefs())[0]
+        self.assertIn("Karlek", best.release)
+
+    def test_nfd_input_matches_nfc_release(self):
+        """Decomposed names arrive from macOS-originated shares and compare
+        unequal to the composed form byte-for-byte."""
+        nfd = unicodedata.normalize("NFD", "Kärlek")
+        self.assertEqual(ranker.normalize(nfd), ranker.normalize("Karlek"))
+
+    def test_more_swedish_titles_fold(self):
+        for accented, plain in [("Sällskapsresan", "Sallskapsresan"),
+                                ("Änglagård", "Anglagard"),
+                                ("Jägarna", "Jagarna"),
+                                ("Så som i himmelen", "Sa som i himmelen")]:
+            self.assertEqual(ranker.normalize(accented), ranker.normalize(plain))
+
+    def test_swedish_release_survives_the_feed(self):
+        xml = torznab.feed_xml([{"title": "Änglagård.1992.1080p", "guid": "h",
+                                 "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT"}])
+        self.assertIn("Änglagård", ET.fromstring(xml).findtext(".//item/title"))
+
+
+class TestFeedWellFormedness(unittest.TestCase):
+    def test_control_characters_do_not_blind_the_feed(self):
+        """RssParser rejects the ENTIRE feed when the document is malformed, so
+        one hostile folder name would hide every other release."""
+        xml = torznab.feed_xml([{"title": "Dune\x00.2021\x08 & <x>", "guid": "h",
+                                 "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT"}])
+        ET.fromstring(xml)          # raises if not well-formed
+
+
+class TestRankerQuality(unittest.TestCase):
+    def _res(self, path, size=9 * 1024**3, users=2):
+        return {"path": path, "size": size, "users": {"count": users},
+                "slots": {"free": 4}, "type": {"id": "directory"}}
+
+    def test_short_title_words_need_a_whole_word_match(self):
+        """A substring test lets 'up' hit almost any release, so a one-word
+        title scored 1/1 against unrelated content and rode the size and user
+        bonuses to the top."""
+        self.assertTrue(ranker._token_in("up", "pixar up 2009 1080p"))
+        self.assertFalse(ranker._token_in("up", "superman 2025 1080p"))
+
+    def test_hub_root_folder_cannot_satisfy_required_quality(self):
+        """Matching the whole path let a hub root named /1080p-Releases/ pass
+        require_quality for a 480p release."""
+        res = [self._res("/1080p-Releases/Dune.2021.DVDRip/480p/")]
+        self.assertEqual(
+            ranker.rank(res, "Dune", 2021, ranker.Prefs(require_quality=["1080p"])), [])
+
+    def test_real_quality_subfolder_still_passes(self):
+        res = [self._res("/1080p-Releases/Dune.2021.BluRay/1080p/")]
+        self.assertEqual(
+            len(ranker.rank(res, "Dune", 2021, ranker.Prefs(require_quality=["1080p"]))), 1)
+
+    def test_ties_break_on_sources_then_size(self):
+        res = [self._res("/m/Dune.2021.1080p.WEB/", size=8 * 1024**3, users=1),
+               self._res("/m/Dune.2021.1080p.WEB/", size=8 * 1024**3, users=9)]
+        self.assertEqual(ranker.rank(res, "Dune", 2021, ranker.Prefs())[0]
+                         .result["users"]["count"], 9)
 
 
 if __name__ == "__main__":

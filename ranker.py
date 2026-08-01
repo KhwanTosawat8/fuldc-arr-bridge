@@ -8,6 +8,7 @@ not in `name`.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 YEAR_RE = re.compile(r"(19\d\d|20\d\d)")
@@ -25,8 +26,40 @@ _norm = re.compile(r"[.\s_\-]+")
 ARTICLE_RE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
 
 
+# Scandinavian letters that are conventionally transliterated rather than
+# stripped. NFKD would turn å into "a", which is what most scene releases do,
+# but "ö" -> "oe" also appears; both spellings must match the same title.
+_FOLD_MAP = str.maketrans({
+    "ß": "ss", "æ": "ae", "ø": "o", "đ": "d", "ð": "d", "þ": "th", "ł": "l",
+})
+
+
+def fold(s: str) -> str:
+    """Strip accents so a title matches however the release spells it.
+
+    'Kärlek' and 'Karlek' are the same film; without folding the title tokens
+    score zero against each other and an unrelated result wins. Also collapses
+    NFD (decomposed) input, which arrives from macOS-originated names and
+    compares unequal to the NFC form byte-for-byte.
+    """
+    s = unicodedata.normalize("NFKD", s.translate(_FOLD_MAP))
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
 def normalize(s: str) -> str:
-    return _norm.sub(" ", s).strip().lower()
+    return _norm.sub(" ", fold(s)).strip().lower()
+
+
+def _token_in(token: str, haystack: str) -> bool:
+    """Does a title word appear in a normalized release name?
+
+    Short words must match whole: a plain substring test lets 'a', 'up' or
+    'it' hit almost any release, so a one-word title scored 1/1 against
+    unrelated content and rode the size/user bonuses to the top.
+    """
+    if len(token) <= 3:
+        return token in haystack.split()
+    return token in haystack
 
 
 def strip_leading_article(title: str) -> str:
@@ -108,10 +141,19 @@ class Candidate:
     path: str = ""
 
     def quality_haystack(self) -> str:
-        """Quality/codec/language tokens often live in a *subfolder* of the
-        release dir (…/Release.Name.2021/1080p/), which parse_release_folder
-        deliberately skips — so match against the whole path, not the name."""
-        return normalize(f"{self.path} {self.release}")
+        """Where a quality token may legitimately appear.
+
+        Quality often lives in a *subfolder* of the release dir
+        (…/Release.Name.2021/1080p/), which parse_release_folder deliberately
+        skips — so the name alone is not enough. But matching the whole path
+        lets a hub root called "/1080p-Releases/" satisfy require_quality for a
+        480p release, the same false-positive class already fixed for
+        BAD_TOKENS. Look only at the release folder and what sits beneath it.
+        """
+        segs = [s for s in self.path.strip("/").split("/") if s]
+        if self.release in segs:
+            segs = segs[segs.index(self.release):]
+        return normalize(" ".join(segs) + " " + self.release)
 
 
 def score_result(result: dict, title: str, year: int | None, prefs: Prefs,
@@ -128,7 +170,7 @@ def score_result(result: dict, title: str, year: int | None, prefs: Prefs,
     score, reasons = 0.0, []
     want = normalize(title)
     want_tokens = [t for t in want.split() if t]
-    hit = sum(1 for t in want_tokens if t in rel_norm)
+    hit = sum(1 for t in want_tokens if _token_in(t, rel_norm))
     if want_tokens:
         frac = hit / len(want_tokens)
         score += 40 * frac
@@ -192,5 +234,10 @@ def rank(results: list[dict], title: str, year: int | None, prefs: Prefs,
         want = [q.lower() for q in prefs.require_quality]
         cands = [c for c in cands
                  if any(q in c.quality_haystack() for q in want)]
-    cands.sort(key=lambda c: c.score, reverse=True)
+    # Tie-break deliberately rather than keeping arbitrary API order: more
+    # sources first, then the larger file (usually the better encode).
+    cands.sort(key=lambda c: (c.score,
+                              (c.result.get("users") or {}).get("count", 0),
+                              c.result.get("size") or 0),
+               reverse=True)
     return cands

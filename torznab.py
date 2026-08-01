@@ -8,6 +8,7 @@ the DC result (see store.py) so the qBittorrent shim can fetch it later.
 
 from __future__ import annotations
 
+import re
 import urllib.parse
 from email.utils import formatdate
 from xml.sax.saxutils import escape
@@ -40,6 +41,23 @@ def caps_xml() -> str:
     <category id="{TV_CAT}" name="TV"/>
   </categories>
 </caps>"""
+
+
+# Characters that are illegal in XML 1.0 even when escaped. Release folder
+# names are arbitrary bytes chosen by hub users, and RssParser rejects the
+# ENTIRE feed if the document is not well-formed — so one bad name would blind
+# the indexer for every other release in the response.
+_ILLEGAL_XML = re.compile(
+    "[^"
+    "\x09\x0a\x0d"
+    "\x20-\ud7ff"
+    "\ue000-\ufffd"
+    "\U00010000-\U0010ffff"
+    "]")
+
+
+def xml_text(s: str) -> str:
+    return escape(_ILLEGAL_XML.sub("", s))
 
 
 def _magnet(h: str, title: str, size: int) -> str:
@@ -94,7 +112,7 @@ def feed_xml(items: list[dict]) -> str:
         seeders = it["seeders"]
         parts += [
             "<item>",
-            f"<title>{escape(it['title'])}</title>",
+            f"<title>{xml_text(it['title'])}</title>",
             f'<guid isPermaLink="false">{it["guid"]}</guid>',
             f"<size>{it['size']}</size>",
             f"<pubDate>{it['pubdate']}</pubDate>",
