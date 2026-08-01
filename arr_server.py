@@ -149,7 +149,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 print("[qbit] delete error:\n" + traceback.format_exc(), flush=True)
             return self._send(200, b"Ok.", "text/plain")
-        # createCategory / setCategory / setForceStart / etc. — accept silently
+        if path in ("/api/v2/torrents/createCategory",
+                    "/api/v2/torrents/editCategory"):
+            # Radarr's client Test creates its category then re-reads
+            # /categories and fails if it still isn't listed, so this must
+            # actually be remembered.
+            f = self._form()
+            qbit.create_category(f.get("category", ""), f.get("savePath", ""))
+            return self._send(200, b"Ok.", "text/plain")
+        # setCategory / setForceStart / etc. — accept silently
         self._read_body()
         self._send(200, b"Ok.", "text/plain")
 
@@ -173,11 +181,28 @@ class Handler(BaseHTTPRequestHandler):
                 # "client unreachable" — true, and recoverable.
                 print(f"[qbit] info error:\n{traceback.format_exc()}", flush=True)
                 return self._send(502, b"[]", "application/json")
+        if path == "/api/v2/torrents/files":
+            # Radarr deserializes this as a JSON *list*; {} is a parse error.
+            return self._json([])
+        if path == "/api/v2/torrents/properties":
+            # IsTorrentLoaded() is literally this call after every add, so
+            # answering {} for an unknown hash makes a failed add look
+            # successful. 404 unless we are actually tracking it.
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            h = (params.get("hash", [""])[0] or "").lower()
+            if h and h in qbit._torrents:
+                return self._json(qbit.properties(h))
+            return self._send(404, b"Not found", "text/plain")
         self._json({})
 
     def _torznab(self, params: dict):
         if not _apikey_ok(params):
-            return self._send(401, b'<error code="100" description="Incorrect API key"/>')
+            # Newznab convention is HTTP 200 with an <error> element, which is
+            # what makes the *arr report "invalid API key" rather than a
+            # generic connection failure.
+            return self._send(
+                200, b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                     b'<error code="100" description="Incorrect user credentials"/>')
         t = params.get("t", ["search"])[0]
         if t == "caps":
             return self._send(200, torznab.caps_xml().encode())
