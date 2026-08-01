@@ -53,9 +53,27 @@ def preferences() -> dict:
     }
 
 
+# How long a failed grab stays visible before it is dropped (see info()).
+FAILED_GRACE_SECONDS = 120
+
+# Radarr/Sonarr's download-client Test creates its configured category if it is
+# missing, then re-reads /categories and fails if it still isn't there. A fixed
+# list therefore fails the Test for anyone using a custom category name.
+_categories: dict[str, dict] = {c: {"name": c, "savePath": ""}
+                                for c in ("radarr", "sonarr", "tv-sonarr")}
+
+
 def categories() -> dict:
-    # advertise the categories Radarr/Sonarr commonly use
-    return {c: {"name": c, "savePath": ""} for c in ("radarr", "sonarr", "tv-sonarr")}
+    with _lock:
+        return dict(_categories)
+
+
+def create_category(name: str, save_path: str = "") -> None:
+    if not name:
+        return
+    with _lock:
+        _categories[name] = {"name": name, "savePath": save_path}
+    print(f"[qbit] category {name!r} registered", flush=True)
 
 
 def _cat_kind(category: str | None) -> str:
@@ -150,6 +168,42 @@ def _state(bundle: dict | None):
     return "downloading", (float(m.group(1)) / 100 if m else 0.0)
 
 
+def properties(h: str) -> dict:
+    """Minimal /torrents/properties body. Radarr calls this to confirm an add
+    landed, and uses save_path from it if content_path was empty."""
+    with _lock:
+        t = dict(_torrents.get(h) or {})
+    save_path, _ = _paths(t, None)
+    return {"save_path": save_path, "piece_size": 0, "pieces_num": 0,
+            "total_size": t.get("size", 0), "addition_date": t.get("added_on", 0),
+            "completion_date": 0, "created_by": "fuldc-arr-bridge",
+            "seeding_time": 0, "share_ratio": 0.0}
+
+
+def _paths(t: dict, bundle: dict | None) -> tuple[str, str]:
+    """(save_path, content_path) in the shape Radarr requires.
+
+    content_path must be the full path of the downloaded item — save_path plus
+    the release name — and must be *strictly different* from save_path. When
+    they are equal Radarr refuses the import outright: "Path matches client
+    base download directory, it's possible 'Keep top-level folder' is
+    disabled".
+
+    FulDC++'s bundle `target` is the target *directory* (trailing backslash),
+    not the downloaded folder, so reporting it as content_path made the two
+    identical for every completed download — i.e. every import was blocked.
+    """
+    target = ((bundle or {}).get("target") or t.get("save_path") or "").rstrip("\\/")
+    name = t.get("name") or ""
+    if not target:
+        return "", ""
+    # If the target already ends in the release name, it *is* the item.
+    if name and target.rsplit("\\", 1)[-1] == name:
+        parent = target.rsplit("\\", 1)[0]
+        return (parent or target), target
+    return target, (f"{target}\\{name}" if name else target)
+
+
 def _bundle_for(client: FulDCClient, t: dict, by_id: dict | None) -> dict | None:
     """Bundle for one tracked torrent, tolerating a partial failure.
 
@@ -184,20 +238,39 @@ def info(client: FulDCClient, category: str | None = None) -> list[dict]:
         if category and t["category"] != category:
             continue
         if t.get("failed"):
+            # Radarr maps qBittorrent's "error" to Warning, never to Failed, so
+            # a failed grab would sit in the queue forever: not blocklisted, not
+            # retried, no alternative sought. Report the error briefly so it is
+            # visible, then stop reporting the item — a grabbed download that
+            # vanishes from the client is what makes Radarr search again.
+            if time.time() - t.get("added_on", 0) > FAILED_GRACE_SECONDS:
+                with _lock:
+                    _torrents.pop(h, None)
+                print(f"[qbit] dropping failed {t['name']!r} so Radarr retries",
+                      flush=True)
+                continue
             state, progress, bundle = "error", 0.0, None
         else:
             bundle = _bundle_for(client, t, by_id)
             state, progress = _state(bundle)
-        content_path = (bundle or {}).get("target") or t["save_path"]
+        save_path, content_path = _paths(t, bundle)
         out.append({
             "hash": h, "name": t["name"], "size": t["size"],
             "progress": progress, "state": state,
-            "save_path": t["save_path"], "content_path": content_path,
+            "save_path": save_path, "content_path": content_path,
             "category": t["category"], "dlspeed": 0, "upspeed": 0,
             "eta": 0 if progress >= 1 else 8640000, "added_on": t["added_on"],
             "amount_left": int(t["size"] * (1 - progress)),
             "completion_on": t["added_on"] if progress >= 1 else 0,
-            "ratio": 1.0, "num_seeds": 0, "num_leechs": 0, "priority": 0, "tags": "",
+            # -2 means "use the global limit". Omitting these makes them
+            # deserialize to 0, and Radarr's HasReachedSeedLimit then reads a
+            # non-negative limit as an explicit one already met — so with
+            # "Remove Completed Downloads" enabled it deletes every download
+            # the instant it finishes.
+            "ratio": 0.0, "ratio_limit": -2,
+            "seeding_time_limit": -2, "inactive_seeding_time_limit": -2,
+            "seeding_time": 0, "last_activity": t["added_on"],
+            "num_seeds": 0, "num_leechs": 0, "priority": 0, "tags": "",
         })
     return out
 
