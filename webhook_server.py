@@ -288,6 +288,33 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _start_season_monitor() -> None:
+    """Background sweep that adds %[inc] monitors for newly-aired seasons of
+    shows you already follow. Off unless SEASON_CHECK_HOURS > 0."""
+    try:
+        hours = float(os.environ.get("SEASON_CHECK_HOURS", "0") or 0)
+    except ValueError:
+        hours = 0.0
+    if hours <= 0:
+        return
+    import season_monitor
+
+    def _loop():
+        time.sleep(60)  # let the pod settle before the first sweep
+        while True:
+            try:
+                season_monitor.sweep(client(),
+                                     dc_root=os.environ.get("DC_ROOT", "S:\\dc"),
+                                     movies_dir=os.environ.get("MOVIES_DIR"),
+                                     log=lambda m: print(m, flush=True))
+            except Exception as e:  # noqa: BLE001
+                print(f"[season] sweep error: {e}", flush=True)
+            time.sleep(hours * 3600)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    print(f"season monitor on: checking for new seasons every {hours:g}h", flush=True)
+
+
 if __name__ == "__main__":
     import sys
     port = int(os.environ.get("PORT", "8080"))
@@ -303,5 +330,6 @@ if __name__ == "__main__":
         print("! WEBHOOK_TOKEN is not set — anyone who can reach this port can "
               "queue downloads. Set it (and add ?token=… to the Seerr webhook "
               "URL) unless this port is strictly LAN-internal.", flush=True)
+    _start_season_monitor()
     print(f"fuldc-arr-bridge webhook listening on :{port}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

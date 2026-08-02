@@ -815,5 +815,44 @@ class TestTorznabFeedFields(unittest.TestCase):
         self.assertIn('name="infohash"', xml)
 
 
+class TestSeasonMonitor(unittest.TestCase):
+    """New-season sweep: add a %[inc] monitor when a season beyond the highest
+    one you follow has aired. find_tv_id / aired_seasons are stubbed (network)."""
+
+    def _client(self, search_string, target):
+        return FakeClient({("GET", "/auto_search/items"):
+                           (200, [{"id": 1, "search_string": search_string,
+                                   "target": {"path": target}}])})
+
+    def test_new_aired_season_creates_monitor(self):
+        import season_monitor
+        c = self._client("The.Boys S05E%[inc] 1080",
+                         "S:\\dc\\series\\The.Boys.2019\\S05\\")
+        season_monitor.find_tv_id = lambda name, log=print: 999
+        season_monitor.aired_seasons = lambda tid, log=print: {1, 2, 3, 4, 5, 6}
+        self.assertEqual(season_monitor.sweep(c, log=lambda m: None), 1)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertIn("The.Boys S06E%[inc]", body["search_string"])
+        self.assertEqual(body["target"], "S:\\dc\\series\\The.Boys.2019\\S06\\")
+        self.assertTrue(body["use_params"])
+
+    def test_nothing_new_is_a_noop(self):
+        import season_monitor
+        c = self._client("Silo S03E%[inc] 1080", "S:\\dc\\series\\Silo.2023\\S03\\")
+        season_monitor.find_tv_id = lambda name, log=print: 5
+        season_monitor.aired_seasons = lambda tid, log=print: {1, 2, 3}
+        self.assertEqual(season_monitor.sweep(c, log=lambda m: None), 0)
+
+    def test_kids_series_root_preserved(self):
+        import season_monitor
+        c = self._client("VeggieTales S01E%[inc] 1080",
+                         "S:\\dc\\kids.series\\VeggieTales.2014\\S01\\")
+        season_monitor.find_tv_id = lambda name, log=print: 7
+        season_monitor.aired_seasons = lambda tid, log=print: {1, 2}
+        season_monitor.sweep(c, log=lambda m: None)
+        self.assertEqual(c.body_for("POST", "/auto_search/items")["target"],
+                         "S:\\dc\\kids.series\\VeggieTales.2014\\S02\\")
+
+
 if __name__ == "__main__":
     unittest.main()

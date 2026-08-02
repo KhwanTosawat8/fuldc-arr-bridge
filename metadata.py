@@ -11,6 +11,7 @@ routing behaves exactly as before.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import urllib.parse
@@ -90,3 +91,52 @@ def classify(tmdb_id: int | None, media_type: str, *, log=print) -> tuple[bool, 
 
 def is_kids(tmdb_id: int | None, media_type: str, *, log=print) -> bool:
     return classify(tmdb_id, media_type, log=log)[0]
+
+
+def _tmdb_search_tv(name: str, api_key: str) -> list[dict]:
+    url = (f"{TMDB_BASE}/search/tv?api_key={urllib.parse.quote(api_key)}"
+           f"&query={urllib.parse.quote(name)}")
+    return _get_json(url).get("results", [])
+
+
+def _seerr_search(name: str, base: str, api_key: str) -> list[dict]:
+    url = f"{base.rstrip('/')}/api/v1/search?query={urllib.parse.quote(name)}"
+    return _get_json(url, headers={"X-Api-Key": api_key}).get("results", [])
+
+
+def find_tv_id(name: str, *, log=print) -> int | None:
+    """Best-effort TMDB id for a show name (first TV match), or None."""
+    if not name or not name.strip():
+        return None
+    tmdb_key = os.environ.get("TMDB_API_KEY", "").strip()
+    seerr_url = os.environ.get("SEERR_URL", "").strip()
+    seerr_key = os.environ.get("SEERR_API_KEY", "").strip()
+    try:
+        if tmdb_key:
+            res = _tmdb_search_tv(name, tmdb_key)
+            return res[0]["id"] if res else None
+        if seerr_url and seerr_key:
+            tv = [x for x in _seerr_search(name, seerr_url, seerr_key)
+                  if x.get("mediaType") == "tv"]
+            return tv[0]["id"] if tv else None
+    except Exception as e:  # noqa: BLE001 - best-effort
+        log(f"# tv search failed for {name!r}: {e}")
+    return None
+
+
+def aired_seasons(tmdb_id: int | None, *, log=print) -> set[int]:
+    """Season numbers (>0) whose air date is on/before today — i.e. that have
+    started airing and so have episodes to grab. Handles both TMDB (snake_case)
+    and Seerr (camelCase) season objects."""
+    d = _details(tmdb_id, "tv", log=log)
+    if not d:
+        return set()
+    today = datetime.date.today().isoformat()
+    out: set[int] = set()
+    for s in d.get("seasons", []):
+        n = s.get("seasonNumber", s.get("season_number", 0)) or 0
+        air = (s.get("airDate") or s.get("air_date") or "")[:10]
+        if n > 0 and air and air <= today:
+            out.add(int(n))
+    return out
+

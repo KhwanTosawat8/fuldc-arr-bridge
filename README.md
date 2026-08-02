@@ -96,6 +96,7 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `SEERR_URL` / `SEERR_API_KEY` | — | alternative metadata source: reuse your Seerr/Jellyseerr/Overseerr |
 | `KIDS_MOVIES_DIR` / `KIDS_SERIES_DIR` | *(from DC_ROOT)* | override kids folders (full Windows paths) |
 | `KIDS_GENRES` | `Kids,Family` | genres that mark a title as kids (Animation alone is **not** kids) |
+| `SEASON_CHECK_HOURS` | `0` | auto new-season detection: every N hours, add a `%[inc]` monitor for a newly-aired season of a show you already follow (needs a metadata source; `0` = off) |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
 | `WEBHOOK_TOKEN` | *(empty)* | shared secret for the webhook endpoint. Blank = **anyone who can reach the port can queue downloads** — set it unless the port is strictly LAN-internal |
 | `PORT` | `8080` | webhook listen port |
