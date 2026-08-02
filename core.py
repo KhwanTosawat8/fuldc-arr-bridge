@@ -10,11 +10,33 @@ Hybrid strategy:
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 
 from fuldc_client import PRIO_HIGH, FulDCClient
 from ranker import Prefs, rank, search_queries, strip_leading_article, scene_title
 
-BAD_SOURCE = "cam camrip ts telesync tc telecine hdcam screener sample workprint"
+# Excluded words for server-side AutoSearch.
+#
+# CAREFUL: this is NOT the same matching as ranker.BAD_TOKENS. FulDC++ splits
+# this string on whitespace and tests each token as a SUBSTRING
+# (SearchQuery::parseSearchString -> StringSearch, "a fast substring search
+# algo", evaluated with match_any). A bare "ts" therefore excludes Ghosts,
+# Roots, Nights and Beatstreet — the AutoSearch item looks perfect in the UI
+# and can never fire.
+#
+# So: long, distinctive tags go in bare; short ambiguous ones only in
+# delimiter-anchored form, which still covers scene naming
+# (Movie.2021.TS.x264, Movie.2021.TS-GROUP) without eating real titles.
+# ranker.BAD_TOKENS keeps the bare forms — it matches on whitespace-split
+# tokens, so it is not affected.
+_BAD_LONG = ["camrip", "telesync", "telecine", "hdcam", "screener",
+             "workprint", "sample"]
+_BAD_SHORT = ["cam", "ts", "tc", "scr"]
+BAD_SOURCE = " ".join(
+    _BAD_LONG + [f"{lead}{t}{trail}"
+                 for t in _BAD_SHORT
+                 for lead, trail in ((".", "."), (".", "-"), ("-", "-"))]
+)
 
 # One-shot AutoSearch items (a specific movie or season) stop searching after
 # this long. Without it an abandoned request searches the hubs forever. The
@@ -88,12 +110,46 @@ def run_search(client: FulDCClient, title: str, year: int | None,
     return None, []
 
 
+@contextmanager
+def searched(client: FulDCClient, title: str, year: int | None, *,
+             wait: float = 10.0, log=print, kind: str = "movie",
+             season: int | None = None, priority: int = PRIO_HIGH):
+    """run_search, with the search instance guaranteed released.
+
+    A FulDC++ search instance lives server-side until it is DELETEd or the
+    session ends. Ranking, download_result and the network can all raise
+    between opening one and closing it, so consumers go through here instead of
+    pairing the calls by hand — every hand-paired site had at least one path
+    that skipped the close.
+    """
+    iid, results = run_search(client, title, year, wait, log, kind, season, priority)
+    try:
+        yield iid, results
+    finally:
+        if iid is not None:
+            try:
+                client.close(iid)
+            except Exception as e:  # noqa: BLE001 - never mask the real error
+                log(f"# warning: could not close search instance {iid}: {e}")
+
+
 def autosearch_matcher(title: str, year: int | None, kind: str = "movie",
                        season: int | None = None) -> str:
     base = scene_title(strip_leading_article(title))
     if kind == "series" and season:
         return f"{base} S{season:02d}"
     return f"{base} {year}" if year else base
+
+
+def _autosearch_min_size(prefs: Prefs, kind: str, season: int | None) -> int:
+    """Size floor to hand the server-side AutoSearch.
+
+    A season request wants a pack, so the movie floor is right; a bare series
+    request with no season may legitimately match one episode, so use the
+    smaller episode floor there."""
+    if kind == "series" and season is None:
+        return prefs.min_size_episode
+    return prefs.min_size
 
 
 def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
@@ -105,18 +161,17 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
     prefs = prefs or Prefs()
     target = resolve_target(kind, title, series, dc_root, target, season,
                             movies_dir, series_dir, year)
-    iid, results = run_search(client, title, year, wait, log, kind, season)
-    if results:
-        cands = rank(results, title, year, prefs, kind=kind)
-        if cands:
-            best = cands[0]
-            info = client.download_result(iid, best.result["id"], target, name=best.release)
-            client.close(iid)
-            return {"mode": "download", "release": best.release, "score": best.score,
-                    "bundle_id": info.get("bundle_id"), "target": target, "season": season}
-        client.close(iid)
-    elif iid is not None:
-        client.close(iid)
+    with searched(client, title, year, wait=wait, log=log,
+                  kind=kind, season=season) as (iid, results):
+        if results:
+            cands = rank(results, title, year, prefs, kind=kind)
+            if cands:
+                best = cands[0]
+                info = client.download_result(iid, best.result["id"], target,
+                                              name=best.release)
+                return {"mode": "download", "release": best.release,
+                        "score": best.score, "bundle_id": info.get("bundle_id"),
+                        "target": target, "season": season}
     # nothing available now -> persistent AutoSearch. Bake the required quality
     # into the search string so FulDC++ only grabs matching releases (the
     # server-side AutoSearch can't reuse the ranker's quality filter).
@@ -133,11 +188,15 @@ def hybrid_grab(client: FulDCClient, title: str, year: int | None, *,
         if prefs.require_quality:
             looks.append(f"(?=.*{re.escape(prefs.require_quality[0])})")
         matcher_type, matcher_string = "regex", "(?i)" + "".join(looks) + ".*"
+    # Give the server the same size floor the ranker applies to live results —
+    # otherwise AutoSearch happily grabs a 40 MB "sample" that rank() would
+    # have thrown out at -40.
     item = client.create_autosearch(matcher, target_directory=target,
                                     excluded=BAD_SOURCE,
                                     expire_days=AUTOSEARCH_TTL_DAYS,
                                     matcher_type=matcher_type,
-                                    matcher_string=matcher_string)
+                                    matcher_string=matcher_string,
+                                    min_size=_autosearch_min_size(prefs, kind, season))
     return {"mode": "autosearch", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}
 
@@ -157,29 +216,29 @@ def grab_tv_season(client: FulDCClient, show: str, season: int, *,
     prefs = prefs or Prefs()
     target = resolve_target("series", show, None, dc_root, None, season,
                             movies_dir, series_dir, year)
-    iid, results = run_search(client, show, None, wait, log, "series", season)
-    if results:
-        cands = rank(results, show, None, prefs, kind="series")
-        if cands:
-            best = cands[0]
-            info = client.download_result(iid, best.result["id"], target, name=best.release)
-            client.close(iid)
-            log(f"# season pack {best.release!r} -> {target}")
-            return {"mode": "download", "release": best.release, "score": best.score,
-                    "bundle_id": info.get("bundle_id"), "target": target, "season": season}
-        client.close(iid)
-    elif iid is not None:
-        client.close(iid)
+    with searched(client, show, None, wait=wait, log=log,
+                  kind="series", season=season) as (iid, results):
+        if results:
+            cands = rank(results, show, None, prefs, kind="series")
+            if cands:
+                best = cands[0]
+                info = client.download_result(iid, best.result["id"], target,
+                                              name=best.release)
+                log(f"# season pack {best.release!r} -> {target}")
+                return {"mode": "download", "release": best.release,
+                        "score": best.score, "bundle_id": info.get("bundle_id"),
+                        "target": target, "season": season}
     return monitor_tv_season(client, show, season, year=year, dc_root=dc_root,
                              movies_dir=movies_dir, series_dir=series_dir,
-                             quality=quality, log=log)
+                             quality=quality, prefs=prefs, log=log)
 
 
 def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
                       year: int | None = None, dc_root: str = "S:\\dc",
                       movies_dir: str | None = None,
                       series_dir: str | None = None, quality: str | None = None,
-                      first_episode: int = 1, log=print) -> dict:
+                      first_episode: int = 1, prefs: Prefs | None = None,
+                      log=print) -> dict:
     """Create a persistent per-episode AutoSearch for an ongoing season using the
     AirDC++ %[inc] increment token — grabs each episode as it appears (existing
     and future). This is the Sonarr-style 'monitor an airing show' behavior,
@@ -196,7 +255,8 @@ def monitor_tv_season(client: FulDCClient, show: str, season: int, *,
     item = client.create_autosearch(matcher, target_directory=target,
                                     excluded=BAD_SOURCE, remove_after_hit=False,
                                     use_params=True, cur_number=first_episode,
-                                    max_number=0, number_length=2)
+                                    max_number=0, number_length=2,
+                                    min_size=(prefs or Prefs()).min_size_episode)
     log(f"# monitor {matcher!r} (from E{first_episode:02d}) -> {target}")
     return {"mode": "monitor", "matcher": matcher,
             "autosearch_id": item.get("id"), "target": target, "season": season}

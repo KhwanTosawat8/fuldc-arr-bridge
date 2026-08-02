@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -25,4 +28,34 @@ jobs:
         env:
           FULDC_PASS: dummy
           TORZNAB_APIKEY: dummy
-        run: python -c "import webhook_server, arr_server, bridge, torznab, qbit, store, notify, plex"
+        run: python -c "import webhook_server, arr_server, bridge, torznab, qbit, store, notify, plex, metadata"
+
+  image:
+    # The Dockerfile COPYs modules by name, so a new module nobody added to it
+    # breaks the container while every source-level check stays green. That has
+    # already shipped once. This is the guard.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every local module is in the Dockerfile COPY list
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          df = pathlib.Path("Dockerfile").read_text()
+          copied = set(re.findall(r"([\w_]+\.py)", df))
+          local = {p.name for p in pathlib.Path(".").glob("*.py")} - {"test_bridge.py"}
+          missing = sorted(local - copied)
+          if missing:
+              sys.exit(f"not COPYed into the image: {missing}")
+          print("all modules copied")
+          PY
+      - name: Build image
+        run: docker build -t fuldc-arr-bridge:ci .
+      - name: Webhook entrypoint imports inside the image
+        run: |
+          docker run --rm -e FULDC_PASS=dummy fuldc-arr-bridge:ci \
+            python -c "import webhook_server, bridge, notify, plex, metadata; print('webhook modules ok')"
+      - name: Arr entrypoint imports inside the image
+        run: |
+          docker run --rm -e FULDC_PASS=dummy -e TORZNAB_APIKEY=dummy fuldc-arr-bridge:ci \
+            python -c "import arr_server, torznab, qbit, store; print('arr modules ok')"

@@ -11,10 +11,25 @@ working-looking AutoSearch item that silently never matches anything.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
+import unicodedata
+import time
 import unittest
+import unittest.mock
+import xml.etree.ElementTree as ET
+
+os.environ.setdefault("FULDC_PASS", "test")
 
 import core
+import fuldc_client
+import httputil
+import qbit
 import ranker
+import store
+import torznab
+import webhook_server
 from fuldc_client import PRIO_HIGH, PRIO_LOW, FulDCClient, FulDCError
 
 
@@ -41,6 +56,25 @@ class FakeClient(FulDCClient):
             if m == method and p == path:
                 return b or {}
         raise AssertionError(f"no {method} {path} in {[(m, p) for m, p, _ in self.calls]}")
+
+    # --- search-instance leak accounting ---------------------------------
+    # A FulDC++ search instance lives server-side until DELETEd (or until the
+    # session ends). Every path that creates one must release it, including the
+    # exception paths — otherwise a flaky hub slowly fills the client with dead
+    # instances and nothing in the bridge notices.
+    @property
+    def opened(self) -> int:
+        return sum(1 for m, p, _ in self.calls if (m, p) == ("POST", "/search"))
+
+    @property
+    def closed(self) -> int:
+        return sum(1 for m, p, _ in self.calls
+                   if m == "DELETE" and p.startswith("/search/"))
+
+    def assert_no_leak(self, test):
+        test.assertEqual(self.opened, self.closed,
+                         f"leaked {self.opened - self.closed} search instance(s): "
+                         f"{[(m, p) for m, p, _ in self.calls]}")
 
 
 class TestAutoSearchIncrementation(unittest.TestCase):
@@ -267,6 +301,518 @@ class TestDirectoryDownloadResolution(unittest.TestCase):
         })
         out = c.download_result(1, "r1", "S:\\dc\\series\\X\\S01\\", name="X.S01")
         self.assertEqual(out["bundle_id"], 999)
+
+
+class TestExcludedWords(unittest.TestCase):
+    """FulDC++ splits excluded_string on whitespace and matches each token as a
+    SUBSTRING (SearchQuery::parseSearchString -> StringSearch.match_any, and
+    StringSearch.h:27 calls itself "a fast substring search algo").
+
+    A bare "ts" therefore excludes any title containing those two letters. The
+    AutoSearch item looks correct in the UI and simply never fires."""
+
+    # Real shows/films that contain a bad-source token as a substring
+    INNOCENT = ["Ghosts", "Roots", "Nights", "Beatstreet", "Watchmen",
+                "Scrubs", "Camelot", "The Last of Us", "Outlander",
+                "Ted Lasso", "Notting Hill", "Scream"]
+
+    # Genuinely bad releases, in the naming DC actually sees
+    JUNK = ["Dune.2021.TS.x264-GRP", "Dune.2021.CAM.XviD",
+            "Dune-2021-TS-GRP", "Movie.2020.TELESYNC.x264",
+            "Movie.2020.HDCAM.x264", "Movie.2020.sample",
+            "Movie.2020.SCR-GRP", "Movie.2020.WORKPRINT"]
+
+    def _excluded(self, name: str) -> list[str]:
+        return [tok for tok in core.BAD_SOURCE.split() if tok in name.lower()]
+
+    def test_real_titles_are_not_excluded(self):
+        for title in self.INNOCENT:
+            self.assertEqual(self._excluded(title), [],
+                             f"{title!r} would never match its own AutoSearch")
+
+    def test_junk_is_still_excluded(self):
+        for name in self.JUNK:
+            self.assertTrue(self._excluded(name), f"{name!r} slipped through")
+
+    def test_no_bare_short_tokens(self):
+        """The guard: any token under 5 chars must be delimiter-anchored."""
+        for tok in core.BAD_SOURCE.split():
+            if len(tok.strip(".-")) < 5:
+                self.assertTrue(tok[0] in ".-" and tok[-1] in ".-",
+                                f"{tok!r} is short and unanchored — it will "
+                                f"match inside ordinary words")
+
+    def test_ranker_keeps_bare_tokens(self):
+        """ranker.BAD_TOKENS matches on whitespace-split tokens, not
+        substrings, so the bare forms are correct there and must stay."""
+        self.assertIn("ts", ranker.BAD_TOKENS)
+        clean = ranker.score_result(
+            {"path": "/tv/Ghosts.S01.1080p/", "size": 9 * 1024**3,
+             "users": {"count": 2}}, "Ghosts", None, ranker.Prefs(), kind="series")
+        self.assertNotIn("BAD-source", clean.reasons)
+
+
+class TestAutoSearchSizeFloor(unittest.TestCase):
+    """The ranker rejects undersized results at -40, but the server-side
+    AutoSearch had no floor at all — so the fallback path would happily grab a
+    40 MB "sample" that a live search would have discarded."""
+
+    def test_movie_fallback_sets_min_size(self):
+        c = FakeClient()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size)
+
+    def test_episode_monitor_uses_the_episode_floor(self):
+        c = FakeClient()
+        core.monitor_tv_season(c, "Severance", 2, log=lambda m: None)
+        body = c.body_for("POST", "/auto_search/items")
+        self.assertEqual(body.get("min_size"), ranker.Prefs().min_size_episode)
+        self.assertLess(body["min_size"], ranker.Prefs().min_size)
+
+
+class TestSearchInstanceLifetime(unittest.TestCase):
+    """Every created search instance must be released on every path."""
+
+    RESULT = [{"id": "ABC", "path": "/m/Dune.2021.1080p/", "size": 9 * 1024**3,
+               "users": {"count": 3}, "slots": {"free": 4}}]
+
+    def _client(self, extra=None):
+        r = {("GET", "/search/1/results/0/200"): (200, list(self.RESULT)),
+             ("POST", "/search/1/results/ABC/download"):
+                 (200, {"bundle_info": {"id": 42}})}
+        r.update(extra or {})
+        return FakeClient(r)
+
+    def test_closed_on_successful_grab(self):
+        c = self._client()
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_download_fails(self):
+        """This is the path that leaked: download_result raises, so the
+        close() on the following line never runs."""
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_ranking_raises(self):
+        c = self._client()
+        with unittest.mock.patch("core.rank", side_effect=RuntimeError("bad")):
+            with self.assertRaises(RuntimeError):
+                core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_no_results(self):
+        c = FakeClient({("GET", "/search/1/results/0/200"): (200, [])})
+        core.hybrid_grab(c, "Dune", 2021, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_on_season_grab_failure(self):
+        c = self._client({("POST", "/search/1/results/ABC/download"):
+                          (500, {"message": "boom"})})
+        with self.assertRaises(FulDCError):
+            core.grab_tv_season(c, "Severance", 2, wait=0, log=lambda m: None)
+        c.assert_no_leak(self)
+
+    def test_closed_when_hub_search_rejected(self):
+        """503 overflow: the instance already exists, so it must be released
+        before the error propagates."""
+        c = FakeClient({("POST", "/search/1/hub_search"): (503, {"message": "overflow"})})
+        with self.assertRaises(FulDCError):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
+
+    def test_closed_when_results_fetch_raises(self):
+        c = FakeClient()
+        c.responses[("GET", "/search/1/results/0/200")] = None   # -> TypeError
+        with self.assertRaises(Exception):
+            c.search("Dune", wait=0)
+        c.assert_no_leak(self)
+
+    def test_closed_when_indexer_ranking_raises(self):
+        c = self._client()
+        with unittest.mock.patch("torznab.rank", side_effect=RuntimeError("bad")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                torznab.search_items(c, query="Dune", kind="movie", season=None,
+                                     limit=10, prefs=ranker.Prefs(), wait=0)
+        c.assert_no_leak(self)
+
+
+class TestSecureEqual(unittest.TestCase):
+    """hmac.compare_digest raises TypeError on a non-ASCII str, and every
+    secret we compare arrives from the network — so the raw call blew up
+    before the auth decision was ever reached, resetting the connection
+    instead of returning 401."""
+
+    def test_matches_and_rejects(self):
+        self.assertTrue(httputil.secure_equal("hunter2", "hunter2"))
+        self.assertFalse(httputil.secure_equal("hunter2", "hunter3"))
+
+    def test_non_ascii_is_a_mismatch_not_a_crash(self):
+        for hostile in ["tökén", "日本語", "\udcff", "café", "Ω"]:
+            self.assertFalse(httputil.secure_equal(hostile, "secret"))
+            self.assertFalse(httputil.secure_equal("secret", hostile))
+        self.assertTrue(httputil.secure_equal("tökén", "tökén"))
+
+    def test_none_is_a_mismatch(self):
+        self.assertFalse(httputil.secure_equal(None, "secret"))
+        self.assertFalse(httputil.secure_equal("secret", None))
+        self.assertFalse(httputil.secure_equal(None, None))
+
+
+class FakeHandler:
+    """Just enough of BaseHTTPRequestHandler for the body helpers."""
+
+    def __init__(self, body: bytes, content_length=None):
+        self.headers = {"Content-Length":
+                        str(len(body)) if content_length is None else content_length}
+        self.rfile = io.BytesIO(body)
+
+
+class TestReadBody(unittest.TestCase):
+    def test_reads_exactly(self):
+        self.assertEqual(httputil.read_body(FakeHandler(b"hello")), b"hello")
+
+    def test_malformed_length_returns_empty(self):
+        # int("٣") is 3 in Python, but that is not a valid Content-Length
+        for bad in ["abc", "", "1.5", "٣", "0x10"]:
+            self.assertEqual(httputil.read_body(FakeHandler(b"data", bad)), b"")
+
+    def test_negative_length_does_not_block(self):
+        """read(-1) blocks until EOF, pinning a request thread."""
+        self.assertEqual(httputil.read_body(FakeHandler(b"data", "-1")), b"")
+
+    def test_caps_allocation(self):
+        h = FakeHandler(b"x" * 100, str(10 * 1024**3))   # claims 10 GB
+        self.assertLessEqual(len(httputil.read_body(h, max_bytes=64)), 64)
+
+    def test_body_too_large_detects_the_claim(self):
+        self.assertTrue(httputil.body_too_large(FakeHandler(b"", "999999999")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "10")))
+        self.assertFalse(httputil.body_too_large(FakeHandler(b"", "junk")))
+
+
+class TestWebhookPayloadHandling(unittest.TestCase):
+    """handle() runs on a detached thread after the 200 was already sent, and
+    the payload template is user-editable in Seerr, so anything can arrive."""
+
+    def _capture(self, payload):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            webhook_server.handle(payload)
+        return buf.getvalue()
+
+    def test_survives_null_media(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": None, "subject": "Dune (2021)"})
+        self.assertIn("[skip]", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_survives_wrong_types(self):
+        for payload in [{"notification_type": 5, "media": "nope", "subject": 12},
+                        {"media": {"media_type": None}},
+                        {"notification_type": "MEDIA_APPROVED", "media": []}]:
+            self.assertNotIn("Traceback", self._capture(payload))
+
+    def test_unknown_media_type_is_never_treated_as_a_movie(self):
+        out = self._capture({"notification_type": "MEDIA_APPROVED",
+                             "media": {"media_type": "anime"},
+                             "subject": "Frieren (2023)"})
+        self.assertIn("unsupported media_type", out)
+
+    def test_errors_are_logged_with_a_traceback(self):
+        with unittest.mock.patch("webhook_server.parse", side_effect=RuntimeError("x")):
+            out = self._capture({"subject": "Dune"})
+        self.assertIn("Traceback", out)
+        self.assertIn("Dune", out)
+
+
+class TestRequestedSeasons(unittest.TestCase):
+    def _p(self, value):
+        return {"extra": [{"name": "Requested Seasons", "value": value}]}
+
+    def test_parses_a_list(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("1, 2")), [1, 2])
+
+    def test_specials_are_kept(self):
+        self.assertEqual(webhook_server.requested_seasons(self._p("0")), [0])
+
+    def test_implausible_numbers_are_dropped(self):
+        """A stray year would otherwise create a permanent S2024 monitor."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(webhook_server.requested_seasons(self._p("2024, 3")), [3])
+
+    def test_tolerates_junk(self):
+        for payload in [{}, {"extra": None}, {"extra": ["nope"]},
+                        self._p("All Seasons"), self._p(None)]:
+            self.assertIsInstance(webhook_server.requested_seasons(payload), list)
+class TestUnicodeDecoding(unittest.TestCase):
+    """FulDC++ is a Windows app serving filenames that came off the hubs, so a
+    cp1252 byte is normal traffic. A bare .decode() raised UnicodeDecodeError,
+    which is not FulDCError and so escaped every caller and killed the request
+    thread."""
+
+    def test_cp1252_body_does_not_raise(self):
+        raw = "Kärlek och Anarki".encode("cp1252")
+        self.assertIsInstance(fuldc_client._decode(raw), str)
+
+    def test_utf8_still_decodes_exactly(self):
+        self.assertEqual(fuldc_client._decode("Kärlek".encode("utf-8")), "Kärlek")
+
+    def test_lone_surrogate_bytes_do_not_raise(self):
+        self.assertIsInstance(fuldc_client._decode(b"\xed\xa0\x80abc"), str)
+
+
+class TestSwedishTitles(unittest.TestCase):
+    """Swedish content is the stated primary use case and had no coverage."""
+
+    def _res(self, path, size=9 * 1024**3, users=3):
+        return {"path": path, "size": size, "users": {"count": users},
+                "slots": {"free": 4}, "type": {"id": "directory"}}
+
+    def test_accented_title_matches_transliterated_release(self):
+        """'Kärlek' and 'Karlek' are the same film; without folding the title
+        tokens score zero and an unrelated result wins."""
+        res = [self._res("/m/Karlek.Och.Anarki.2020.1080p.WEB/"),
+               self._res("/m/Something.Else.2020.1080p.WEB/")]
+        best = ranker.rank(res, "Kärlek och Anarki", 2020, ranker.Prefs())[0]
+        self.assertIn("Karlek", best.release)
+
+    def test_nfd_input_matches_nfc_release(self):
+        """Decomposed names arrive from macOS-originated shares and compare
+        unequal to the composed form byte-for-byte."""
+        nfd = unicodedata.normalize("NFD", "Kärlek")
+        self.assertEqual(ranker.normalize(nfd), ranker.normalize("Karlek"))
+
+    def test_more_swedish_titles_fold(self):
+        for accented, plain in [("Sällskapsresan", "Sallskapsresan"),
+                                ("Änglagård", "Anglagard"),
+                                ("Jägarna", "Jagarna"),
+                                ("Så som i himmelen", "Sa som i himmelen")]:
+            self.assertEqual(ranker.normalize(accented), ranker.normalize(plain))
+
+    def test_swedish_release_survives_the_feed(self):
+        xml = torznab.feed_xml([{"title": "Änglagård.1992.1080p", "guid": "h",
+                                 "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
+        self.assertIn("Änglagård", ET.fromstring(xml).findtext(".//item/title"))
+
+
+class TestFeedWellFormedness(unittest.TestCase):
+    def test_control_characters_do_not_blind_the_feed(self):
+        """RssParser rejects the ENTIRE feed when the document is malformed, so
+        one hostile folder name would hide every other release."""
+        xml = torznab.feed_xml([{"title": "Dune\x00.2021\x08 & <x>", "guid": "h",
+                                 "size": 1, "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
+        ET.fromstring(xml)          # raises if not well-formed
+
+
+class TestRankerQuality(unittest.TestCase):
+    def _res(self, path, size=9 * 1024**3, users=2):
+        return {"path": path, "size": size, "users": {"count": users},
+                "slots": {"free": 4}, "type": {"id": "directory"}}
+
+    def test_short_title_words_need_a_whole_word_match(self):
+        """A substring test lets 'up' hit almost any release, so a one-word
+        title scored 1/1 against unrelated content and rode the size and user
+        bonuses to the top."""
+        self.assertTrue(ranker._token_in("up", "pixar up 2009 1080p"))
+        self.assertFalse(ranker._token_in("up", "superman 2025 1080p"))
+
+    def test_hub_root_folder_cannot_satisfy_required_quality(self):
+        """Matching the whole path let a hub root named /1080p-Releases/ pass
+        require_quality for a 480p release."""
+        res = [self._res("/1080p-Releases/Dune.2021.DVDRip/480p/")]
+        self.assertEqual(
+            ranker.rank(res, "Dune", 2021, ranker.Prefs(require_quality=["1080p"])), [])
+
+    def test_real_quality_subfolder_still_passes(self):
+        res = [self._res("/1080p-Releases/Dune.2021.BluRay/1080p/")]
+        self.assertEqual(
+            len(ranker.rank(res, "Dune", 2021, ranker.Prefs(require_quality=["1080p"]))), 1)
+
+    def test_ties_break_on_sources_then_size(self):
+        res = [self._res("/m/Dune.2021.1080p.WEB/", size=8 * 1024**3, users=1),
+               self._res("/m/Dune.2021.1080p.WEB/", size=8 * 1024**3, users=9)]
+        self.assertEqual(ranker.rank(res, "Dune", 2021, ranker.Prefs())[0]
+                         .result["users"]["count"], 9)
+
+class TestStoreEviction(unittest.TestCase):
+    def setUp(self):
+        store._store.clear()
+
+    def test_get_promotes_so_active_entries_survive(self):
+        """Insertion order is not LRU: without promotion on read, two indexers
+        RSS-syncing evict the map within hours, so a release found in the
+        morning fails as 'unknown magnet' that evening."""
+        store.put("keep", {"release": "A"})
+        for i in range(store._MAX):
+            if i == store._MAX // 2:
+                store.get("keep")          # touched halfway through
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertIsNotNone(store.get("keep"),
+                             "an entry read recently was evicted anyway")
+
+    def test_cap_is_enforced(self):
+        for i in range(store._MAX + 50):
+            store.put(f"f{i}", {"release": str(i)})
+        self.assertLessEqual(len(store._store), store._MAX)
+
+
+class TestQbitReporting(unittest.TestCase):
+    """Radarr's queue is driven entirely by /torrents/info. Reporting the
+    wrong thing there loses downloads silently."""
+
+    def setUp(self):
+        qbit._torrents.clear()
+        store._store.clear()
+
+    def test_partial_bundle_failure_keeps_the_rest(self):
+        """One unreachable bundle must not empty the whole response — Radarr
+        reads [] as 'every download disappeared' and clears its queue."""
+        qbit._track("a" * 40, {"name": "A", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 1})
+        qbit._track("b" * 40, {"name": "B", "category": "radarr", "size": 100,
+                               "save_path": "S:\\dc\\movies", "added_on": 0,
+                               "bundle_id": 2})
+
+        class Boom(FakeClient):
+            def list_bundles(self, *a, **kw):
+                raise RuntimeError("FulDC++ unreachable")
+
+            def get_bundle(self, bid):
+                if bid == 1:
+                    raise RuntimeError("gone")
+                return {"id": 2, "status": {"id": "queued", "str": "50%"}}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = qbit.info(Boom(), "radarr")
+        self.assertEqual(len(out), 2, "a failed lookup dropped the other torrent")
+
+    def test_duplicate_add_is_ignored(self):
+        h = "c" * 40
+        qbit._track(h, {"name": "A", "category": "radarr", "size": 1,
+                        "save_path": "", "added_on": 0, "bundle_id": 9})
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertEqual(qbit._torrents[h]["bundle_id"], 9,
+                         "a retried add re-queued the same release")
+
+    def test_unknown_magnet_is_reported_failed(self):
+        h = "d" * 40
+        with contextlib.redirect_stdout(io.StringIO()):
+            qbit.add(FakeClient(), [f"magnet:?xt=urn:btih:{h}"], "radarr")
+        self.assertTrue(qbit._torrents[h]["failed"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(qbit.info(FakeClient(), "radarr")[0]["state"], "error")
+
+
+class _NoBundles(FakeClient):
+    def list_bundles(self, *a, **kw):
+        return []
+
+
+class TestArrPathBlockers(unittest.TestCase):
+    """Five independent faults, each of which alone prevents a release ever
+    reaching the library. Verified against Radarr/Sonarr's own source."""
+
+    NAME = "Dune.2021.1080p.BluRay.x264-GRP"
+
+    def setUp(self):
+        qbit._torrents.clear()
+
+    def _row(self, entry):
+        qbit._track("a" * 40, entry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows = qbit.info(_NoBundles(), "radarr")
+        return rows[0] if rows else None
+
+    def test_content_path_differs_from_save_path(self):
+        """Radarr: if ContentPath == SavePath it sets the item to Warning and
+        refuses to import — 'Path matches client base download directory'."""
+        sp, cp = qbit._paths({"name": self.NAME, "save_path": "S:\\dc\\movies\\"},
+                             {"target": "S:\\dc\\movies\\"})
+        self.assertNotEqual(sp, cp)
+        self.assertTrue(cp.endswith(self.NAME), cp)
+
+    def test_content_path_is_not_doubled_when_target_is_the_item(self):
+        sp, cp = qbit._paths({"name": self.NAME},
+                             {"target": "S:\\dc\\movies\\" + self.NAME})
+        self.assertEqual(cp, "S:\\dc\\movies\\" + self.NAME)
+        self.assertEqual(sp, "S:\\dc\\movies")
+
+    def test_seed_limits_say_use_global(self):
+        """Omitted limits deserialize to 0, and HasReachedSeedLimit then reads
+        that as an explicit limit already met — so Radarr deletes every
+        completed download when 'Remove Completed Downloads' is on."""
+        row = self._row({"name": self.NAME, "category": "radarr", "size": 100,
+                         "save_path": "S:\\dc\\movies\\", "added_on": 0,
+                         "bundle_id": None})
+        for field in ("ratio_limit", "seeding_time_limit",
+                      "inactive_seeding_time_limit"):
+            self.assertEqual(row[field], -2, field)
+
+    def test_failed_grab_is_dropped_so_radarr_retries(self):
+        """Radarr maps 'error' to Warning, never Failed: the item would sit in
+        the queue forever, never blocklisted, never retried."""
+        entry = {"name": self.NAME, "category": "radarr", "size": 1,
+                 "save_path": "", "bundle_id": None, "failed": True,
+                 "added_on": int(time.time())}
+        self.assertIsNotNone(self._row(dict(entry)), "should show during grace")
+        qbit._torrents.clear()
+        entry["added_on"] = int(time.time()) - qbit.FAILED_GRACE_SECONDS - 1
+        self.assertIsNone(self._row(entry), "should be dropped after grace")
+
+    def test_custom_category_survives_create(self):
+        """The client Test creates its category, re-reads /categories, and
+        fails if it still isn't listed."""
+        qbit.create_category("radarr-4k", "S:\\dc\\4k")
+        self.assertIn("radarr-4k", qbit.categories())
+
+    def test_rss_query_is_not_empty(self):
+        """Radarr's indexer Test is one RSS request with no search terms, and
+        zero items is a hard ValidationFailure — so an empty result made the
+        indexer impossible to add at all."""
+        c = FakeClient({("GET", "/search/1/results/0/200"): (200, [])})
+        with contextlib.redirect_stdout(io.StringIO()):
+            torznab.search_items(c, query="", kind="movie", season=None,
+                                 limit=10, prefs=ranker.Prefs(), wait=0)
+        self.assertTrue(any(p.endswith("/hub_search") for _, p, _ in c.calls),
+                        "an empty query never reached the hubs")
+
+
+class TestTorznabFeedFields(unittest.TestCase):
+    def test_pubdate_is_stable(self):
+        """Radarr matches pending releases on title+pubDate+indexer, so a
+        pubDate of 'now' produces duplicate pending entries and re-grabs."""
+        h = "c" * 40
+        self.assertEqual(torznab._pubdate({"time": 0}, h),
+                         torznab._pubdate({"time": None}, h))
+
+    def test_millisecond_timestamps_do_not_poison_the_feed(self):
+        """RssParser rejects the ENTIRE feed when a pubDate fails to parse."""
+        got = torznab._pubdate({"time": 1700000000000}, "d" * 40)
+        self.assertIn("2023", got)
+
+    def test_size_and_infohash_are_torznab_attrs(self):
+        """A bare <size> element is not parsed; blocklisting keys on infohash."""
+        xml = torznab.feed_xml([{"title": "X", "guid": "h", "size": 123,
+                                 "magnet": "magnet:?xt=urn:btih:" + "e" * 40,
+                                 "cat": 2000, "seeders": 1,
+                                 "pubdate": "Tue, 12 Jan 2010 03:51:47 GMT",
+                                 "infohash": "e" * 40}])
+        self.assertIn('name="size" value="123"', xml)
+        self.assertIn('name="infohash"', xml)
 
 
 if __name__ == "__main__":

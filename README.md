@@ -170,9 +170,22 @@ Feedback welcome — see [DESIGN.md](DESIGN.md) for the architecture.
 
 ## Advanced: Kubernetes
 
-Manifests for a Talos/k8s deployment (Deployment + Service + ExternalSecret) are
-in [`k8s/`](k8s/). Point `FULDC_URL` at your FulDC++ host and supply `FULDC_PASS`
-via your secret manager.
+Manifests for a Talos/k8s deployment (Namespace + Deployment + Service) are in
+[`k8s/`](k8s/), covering the **Seerr webhook flow only** — there is no manifest
+for the experimental arr server. Point `FULDC_URL` at your FulDC++ host and
+create the secret:
+
+```bash
+kubectl create secret generic fuldc-bridge-secret \
+  --from-literal=FULDC_PASS=... \
+  --from-literal=WEBHOOK_TOKEN=...     # optional
+```
+
+If you use an external secret manager, supply the same keys however you
+normally do — the Deployment just reads `fuldc-bridge-secret`.
+
+Note the Deployment uses `strategy: Recreate`. The release→magnet map is
+in-process, so two pods behind one Service answer with different state.
 
 ## Notes & limitations
 

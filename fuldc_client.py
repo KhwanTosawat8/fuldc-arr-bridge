@@ -15,6 +15,22 @@ import urllib.request
 from typing import Any
 
 
+def _decode(raw: bytes) -> str:
+    """Decode an API response body without ever raising.
+
+    A bare .decode() assumes UTF-8. FulDC++ is a Windows application serving
+    filenames that came off the hubs, so a single cp1252 byte — an å, ä or ö
+    from a Swedish release — produced UnicodeDecodeError. That is not
+    FulDCError, so it escaped every caller's handler and killed the request
+    thread outright. Replacing undecodable bytes degrades one title rather
+    than losing the whole request.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace")
+
+
 class FulDCError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
@@ -47,10 +63,10 @@ class FulDCClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                raw = r.read().decode()
+                raw = _decode(r.read())
                 return r.status, (json.loads(raw) if raw.strip() else None)
         except urllib.error.HTTPError as e:
-            body_txt = e.read().decode()
+            body_txt = _decode(e.read())
             try:
                 return e.code, json.loads(body_txt or "{}")
             except json.JSONDecodeError:
@@ -87,11 +103,22 @@ class FulDCClient:
         st, inst = self._call("POST", "/search")
         if st != 200:
             raise FulDCError(f"create search instance http {st}: {inst}", st)
+        if not isinstance(inst, dict) or inst.get("id") is None:
+            raise FulDCError(f"create search instance: unexpected body {inst!r}", st)
         iid = inst["id"]
+        # The instance now exists server-side and lives until we DELETE it, so
+        # nothing below may escape without closing it first.
+        try:
+            return iid, self._collect(iid, pattern, wait, poll, plateau, priority)
+        except BaseException:
+            self.close(iid)
+            raise
+
+    def _collect(self, iid: int, pattern: str, wait: float, poll: float,
+                 plateau: float, priority: int) -> list[dict]:
         st, data = self._call("POST", f"/search/{iid}/hub_search",
                               {"priority": priority, "query": {"pattern": pattern}})
         if st != 200:
-            self.close(iid)
             # 503 = "Search queue overflow": the client's outgoing search queue
             # is backed up past 20 minutes. Caller decides whether to back off.
             raise FulDCError(f"hub_search http {st}: {data}", st)
@@ -106,7 +133,7 @@ class FulDCClient:
             elif count > 0 and (time.time() - stable_since) >= plateau:
                 break
         _, results = self._call("GET", f"/search/{iid}/results/0/200")
-        return iid, (results or [])
+        return results or []
 
     def close(self, instance_id: int) -> None:
         self._call("DELETE", f"/search/{instance_id}")
