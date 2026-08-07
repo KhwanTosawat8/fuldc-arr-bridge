@@ -96,6 +96,7 @@ Then request something → approve it → watch `docker compose logs -f`.
 | `SEERR_URL` / `SEERR_API_KEY` | — | alternative metadata source: reuse your Seerr/Jellyseerr/Overseerr |
 | `KIDS_MOVIES_DIR` / `KIDS_SERIES_DIR` | *(from DC_ROOT)* | override kids folders (full Windows paths) |
 | `KIDS_GENRES` | `Kids,Family` | genres that mark a title as kids (Animation alone is **not** kids) |
+| `SEASON_CHECK_HOURS` | `0` | auto new-season detection: every N hours, add a `%[inc]` monitor for a newly-aired season of a show you already follow (needs a metadata source; `0` = off) |
 | `MEDIASERVER` | `none` | optional post-download refresh: `plex` \| `jellyfin` \| `webhook` \| `none` |
 | `WEBHOOK_TOKEN` | *(empty)* | shared secret for the webhook endpoint. Blank = **anyone who can reach the port can queue downloads** — set it unless the port is strictly LAN-internal |
 | `PORT` | `8080` | webhook listen port |
@@ -201,13 +202,14 @@ in-process, so two pods behind one Service answer with different state.
 ## Credits
 
 Built on the [AirDC++ Web API](https://airdcpp.docs.apiary.io/). Thanks to the
-**FulDC++** developers (Sulan & Lansh) and **AirDC-NG** for confirming the
-`auto_search` / RSS API surface.
+**FulDC++** team and to **[KhwanTosawat8](https://github.com/KhwanTosawat8)** for
+confirming the `auto_search` / RSS API surface.
 
-Special thanks to **[Lansh](https://github.com/KhwanTosawat8) (AirDC-NG)** for
-substantial code contributions — AutoSearch `%[inc]` incrementation
-(`use_params`), search priority, 409 duplicate handling, download-path safety,
-and the test suite + CI — grounded in the AirDC++ source. See the
+Special thanks to **[KhwanTosawat8](https://github.com/KhwanTosawat8)** — an
+AirDC++ developer — for substantial code contributions: AutoSearch `%[inc]`
+incrementation (`use_params`), search priority, duplicate handling,
+download-path safety, HTTP hardening, and the test suite + CI, all grounded in
+the AirDC++ source. See the
 [contributors](https://github.com/Pete1979/fuldc-arr-bridge/graphs/contributors).
 
 ## License
